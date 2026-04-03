@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['Ripe']
+
+roboflow:
+  workspace: 2metu
+  project: ripe-tomatoes-k9shw
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/2metu/ripe-tomatoes-k9shw/dataset/1

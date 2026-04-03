@@ -1,0 +1,37 @@
+# Old training runs (only keep train6/weights/best.pt)
+runs/detect/train/
+runs/detect/train2/
+runs/detect/train3/
+runs/detect/train4/
+runs/detect/train5/
+runs/detect/runs/
+runs/detect/train6/*.jpg
+runs/detect/train6/*.png
+runs/detect/train6/*.csv
+runs/detect/train6/weights/last.pt
+
+# Dataset folders (not needed on Pi)
+images/
+labels/
+train/
+valid/
+test/
+
+# Large files not needed on Pi
+*.zip
+yolov8s.pt
+yolov8n.pt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/

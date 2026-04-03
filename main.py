@@ -1,0 +1,279 @@
+"""
+Integrated Tomato-Harvesting System — main.py
+===============================================
+Unifies the vision subsystem (YOLOv8 + filters) with the 5-DOF robotic arm
+subsystem for autonomous ripe-tomato detection, approach, cut, and collection.
+
+Workflow:
+  1. ARM → Search Home (camera faces outward)
+  2. VISION → Continuous detection loop on live camera
+  3. LOCK → When a ripe tomato is detected consistently for CONFIRM_SECONDS,
+             lock its 3D position
+  4. ARM → Solve IK for the cut point (1 cm from tomato surface toward stem)
+  5. ARM → Move from Search Home → cut pose over safe trajectory
+  6. ARM → Close gripper / scissors to cut
+  7. ARM → Retract to Search Home
+  8. Repeat
+
+Usage:
+  python main.py                  # real hardware (RPi5 + Hiwonder servos)
+  python main.py --sim            # simulation mode (no servos, log only)
+  python main.py --gui            # launch 3D simulation GUI instead
+
+Hand-in-Eye: camera is mounted between wrist (ID3) and gripper (ID1).
+The arm must be at Search Home for the camera to see the workspace.
+"""
+
+import argparse
+import json
+import logging
+import sys
+import time
+import cv2
+import numpy as np
+
+from vision import TomatoDetector
+from arm_controller import (
+    FiveDOFArm, angles_to_pulses, search_home_angles,
+    compute_cut_point, SERVO_IDS, SEARCH_HOME_PULSES,
+)
+from servo_driver import ServoDriver
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+CONFIRM_SECONDS    = 5.0     # seconds a tomato must be visible before acting
+CONFIRM_FRAMES     = 8       # minimum detections within the confirm window
+MOVE_DURATION_MS   = 800     # servo move duration for arm motion
+GRIPPER_DELAY_S    = 0.6     # wait after gripper command
+RETRACT_DELAY_S    = 1.0     # wait after retract before next scan
+TOMATO_RADIUS_M    = 0.035   # average tomato radius in metres
+CAMERA_INDEX       = 0       # default camera
+
+# ── Camera-to-arm transform ───────────────────────────────────────────────────
+# Because our camera is Hand-in-Eye (mounted on the wrist), the detected
+# xyz_cm is in the camera frame.  At Search Home the camera has a known
+# pose relative to the arm base.  This offset transforms camera coords
+# into arm-base coords.  CALIBRATE THESE VALUES on the real robot.
+#
+# Approximate offsets when arm is at Search Home position:
+#   Camera is ~0.25m in front of the base, ~0.20m above ground, angled down.
+CAMERA_OFFSET_M = np.array([0.15, 0.0, 0.18], dtype=float)
+
+
+def camera_to_arm_frame(xyz_cm_dict):
+    """Convert vision xyz_cm (camera frame) → arm base frame (metres)."""
+    cam = np.array([xyz_cm_dict["x"], xyz_cm_dict["y"], xyz_cm_dict["z"]],
+                   dtype=float) / 100.0
+    # In hand-in-eye at Search Home: camera Z ≈ arm X (forward),
+    # camera X ≈ arm -Y, camera Y ≈ arm -Z
+    arm_x = cam[2] + CAMERA_OFFSET_M[0]   # depth → forward
+    arm_y = -cam[0] + CAMERA_OFFSET_M[1]  # left/right
+    arm_z = -cam[1] + CAMERA_OFFSET_M[2]  # up/down
+    return np.array([arm_x, arm_y, arm_z], dtype=float)
+
+
+# ── Trajectory interpolation ──────────────────────────────────────────────────
+def interpolate_trajectory(q_start, q_end, steps=20):
+    """Linear joint-space interpolation."""
+    traj = []
+    for s in range(steps + 1):
+        alpha = s / steps
+        q = (1 - alpha) * np.array(q_start) + alpha * np.array(q_end)
+        traj.append(q)
+    return traj
+
+
+# ── Main harvesting loop ──────────────────────────────────────────────────────
+def run_harvesting(sim_mode=False):
+    mode = "sim" if sim_mode else "real"
+    logger.info(f"Starting harvesting system in {mode.upper()} mode")
+
+    # Initialise subsystems
+    detector = TomatoDetector()
+    arm = FiveDOFArm()
+    driver = ServoDriver(mode=mode)
+
+    # Move to Search Home
+    logger.info("Moving arm to Search Home position...")
+    home_angles = search_home_angles()
+    arm.set_joint_angles(home_angles)
+    driver.go_search_home(duration_ms=1200)
+    time.sleep(1.5)
+
+    # Open camera
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        logger.error("Cannot open camera!")
+        return
+    logger.info(f"Camera opened: index={CAMERA_INDEX}")
+
+    # Detection confirmation buffer
+    confirm_buffer = []  # list of (timestamp, detection_dict)
+    state = "SCANNING"   # SCANNING → CONFIRMING → ACTING → RETRACTING
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning("Frame grab failed")
+                continue
+
+            if state in ("SCANNING", "CONFIRMING"):
+                detections = detector.detect(frame)
+                annotated = detector.annotate(frame, detections)
+                now = time.time()
+
+                if detections:
+                    # Pick the highest-confidence detection
+                    best = max(detections, key=lambda d: d["confidence"])
+
+                    confirm_buffer.append((now, best))
+                    # Purge old entries outside the confirm window
+                    confirm_buffer = [(t, d) for t, d in confirm_buffer
+                                      if now - t <= CONFIRM_SECONDS]
+
+                    if state == "SCANNING":
+                        state = "CONFIRMING"
+                        logger.info(f"Tomato spotted! Confirming for {CONFIRM_SECONDS}s...")
+
+                    # Check if we have enough consistent detections
+                    if (len(confirm_buffer) >= CONFIRM_FRAMES and
+                            now - confirm_buffer[0][0] >= CONFIRM_SECONDS):
+                        # Average the confirmed position
+                        positions = [d["xyz_cm"] for _, d in confirm_buffer]
+                        avg_x = np.mean([p["x"] for p in positions])
+                        avg_y = np.mean([p["y"] for p in positions])
+                        avg_z = np.mean([p["z"] for p in positions])
+                        locked_xyz_cm = {"x": avg_x, "y": avg_y, "z": avg_z}
+
+                        logger.info(f"LOCKED tomato at (cm): "
+                                    f"X={avg_x:.1f} Y={avg_y:.1f} Z={avg_z:.1f}")
+
+                        state = "ACTING"
+                        confirm_buffer.clear()
+
+                        # ── Execute harvest sequence ───────────────────────────
+                        _execute_harvest(arm, driver, locked_xyz_cm, annotated)
+
+                        state = "RETRACTING"
+                        # Retract to Search Home
+                        logger.info("Retracting to Search Home...")
+                        arm.set_joint_angles(home_angles)
+                        pulses = angles_to_pulses(home_angles)
+                        driver.move_servos(pulses, duration_ms=1000)
+                        time.sleep(RETRACT_DELAY_S)
+
+                        state = "SCANNING"
+                        logger.info("Ready for next tomato.\n")
+                else:
+                    # No detection this frame — decay buffer
+                    confirm_buffer = [(t, d) for t, d in confirm_buffer
+                                      if now - t <= CONFIRM_SECONDS]
+                    if not confirm_buffer:
+                        state = "SCANNING"
+
+                # Show status on annotated frame
+                status_text = f"State: {state}"
+                if state == "CONFIRMING":
+                    elapsed = now - confirm_buffer[0][0] if confirm_buffer else 0
+                    status_text += f"  ({elapsed:.1f}/{CONFIRM_SECONDS}s, " \
+                                   f"{len(confirm_buffer)} frames)"
+                cv2.putText(annotated, status_text, (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.imshow("Tomato Harvester", annotated)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                logger.info("User pressed 'q' — exiting.")
+                break
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user.")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        driver.go_park(duration_ms=1000)
+        driver.close()
+        logger.info("System shut down.")
+
+
+def _execute_harvest(arm, driver, locked_xyz_cm, frame):
+    """Execute the full harvest: IK solve → move → cut → open gripper."""
+    # Convert camera-frame coords to arm-base frame
+    target_m = camera_to_arm_frame(locked_xyz_cm)
+    logger.info(f"Arm-frame target (m): {target_m}")
+
+    # Check reachability
+    if not arm.is_reachable(target_m):
+        logger.warning("Target is OUT OF REACH — skipping.")
+        return
+
+    # Compute cut point (1 cm from tomato surface toward base/stem)
+    edge_pt, cut_pt = compute_cut_point(target_m, TOMATO_RADIUS_M, arm.base_pos)
+    logger.info(f"Cut point (m): {cut_pt}")
+
+    # Save current (search-home) joint config
+    q_home = arm.joint_angles.copy()
+
+    # Open gripper before approach
+    driver.gripper_open(duration_ms=400)
+    time.sleep(0.5)
+
+    # Solve IK for the cut point
+    solved, err, iters = arm.inverse_kinematics(cut_pt, max_iters=400, tol=5e-4)
+    q_cut = arm.joint_angles.copy()
+    logger.info(f"IK solved={solved}, error={err:.4f}m, iters={iters}")
+
+    if not solved and err > 0.02:
+        logger.warning(f"IK error too large ({err:.4f}m) — aborting harvest.")
+        arm.set_joint_angles(q_home)
+        return
+
+    # Move arm along interpolated trajectory: home → cut
+    traj = interpolate_trajectory(q_home, q_cut, steps=25)
+    for q in traj:
+        arm.set_joint_angles(q)
+        pulses = angles_to_pulses(q)
+        driver.move_servos(pulses, duration_ms=MOVE_DURATION_MS // 25)
+        time.sleep(MOVE_DURATION_MS / 25000.0)
+
+    # Small settling delay at cut position
+    time.sleep(0.3)
+
+    # Close gripper / scissors to cut the stem
+    logger.info("CUTTING — closing gripper...")
+    driver.gripper_close(duration_ms=500)
+    time.sleep(GRIPPER_DELAY_S)
+    logger.info("Cut complete.")
+
+    # Open gripper to release (tomato falls into net below)
+    driver.gripper_open(duration_ms=400)
+    time.sleep(0.3)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="Tomato Harvesting Robot — Integrated System")
+    parser.add_argument("--sim", action="store_true",
+                        help="Run in simulation mode (no real servos)")
+    parser.add_argument("--gui", action="store_true",
+                        help="Launch the 3D simulation GUI")
+    parser.add_argument("--camera", type=int, default=0,
+                        help="Camera index (default: 0)")
+    args = parser.parse_args()
+
+    global CAMERA_INDEX
+    CAMERA_INDEX = args.camera
+
+    if args.gui:
+        from simulation_gui import launch_gui
+        launch_gui()
+    else:
+        run_harvesting(sim_mode=args.sim)
+
+
+if __name__ == "__main__":
+    main()
