@@ -1,0 +1,17 @@
+Exact validated HOME BASE pose backup
+====================================
+
+Canonical servo pulses:
+- ID 6: 500
+- ID 5: 850
+- ID 4: 850
+- ID 3: 124
+- ID 1: 350
+
+Quick restore command:
+/usr/bin/python go_home_base_exact.py
+
+Notes:
+- This is the user-approved home base pose.
+- Use this pose whenever the user says "home base".
+- Move slowly (>= 8000 ms) for safety.

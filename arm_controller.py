@@ -1,40 +1,42 @@
 """
 5-DOF Robotic Arm Controller — Kinematics + Inverse Kinematics
 ===============================================================
-Adapted for Hiwonder ArmPi Pro (modified to 5DOF from 6DOF).
+Generic 5-DOF arm with daisy-chained serial bus servos (LX-16A/LX-225)
+connected via port P4 on the RPi5 expansion board.
 
-Servo index → Serial Bus ID mapping:
+Servo index → ID mapping (on the daisy chain):
   [0] → ID 6  (Base / Yaw)
-  [1] → ID 5  (Shoulder)  — INVERTED, pulse limits 150–850
-  [2] → ID 4  (Elbow)     — INVERTED, pulse limits 150–850
+  [1] → ID 5  (Shoulder)  — INVERTED
+  [2] → ID 4  (Elbow)     — INVERTED
   [3] → ID 3  (Wrist Pitch)
-  [4] → ID 1  (Gripper)   — independent of IK chain
+  [4] → ID 1  (Gripper / Scissors)
 
-Neutral pulse = 500 (0 radians).
-Hand-in-Eye camera between ID3 and ID1.
-Search Home pulses: ID6:500, ID5:700, ID4:250, ID3:400
+Bus servo pulse range: 0–1000 (centre 500).
+Hand-in-Eye camera mounted between wrist (ID3) and gripper (ID1).
 """
 
 import math
 import numpy as np
 
 # ── Servo mapping ──────────────────────────────────────────────────────────────
-SERVO_IDS       = [6, 5, 4, 3, 1]   # index → serial bus ID
+SERVO_IDS       = [6, 5, 4, 3, 1]   # index → serial bus ID on daisy chain
 INVERTED_JOINTS = {1, 2}            # indices whose direction is negated
-NEUTRAL_PULSE   = 500
+NEUTRAL_PULSE   = 500               # Bus servo centre (0–1000 range)
 PULSE_MIN       = 0
 PULSE_MAX       = 1000
-SAFE_PULSE_MIN  = {1: 150, 2: 150}  # IDs 5,4 need tighter limits
+SAFE_PULSE_MIN  = {1: 150, 2: 150}  # Shoulder, Elbow restricted
 SAFE_PULSE_MAX  = {1: 850, 2: 850}
 
-# Search-Home pulses (arm looks outward for camera to scan)
-SEARCH_HOME_PULSES = {6: 500, 5: 700, 4: 250, 3: 400, 1: 500}
+# Default/Search-Home pulses (validated front-facing home base)
+# This pose is also used as the default home base.
+SEARCH_HOME_PULSES = {6: 500, 5: 850, 4: 850, 3: 124, 1: 350}
 
-# Pulse-per-radian conversion (Hiwonder LX-series ≈ 240 steps/rad)
+# Pulse-per-radian conversion (~240 steps/rad in 0–1000 range)
 PULSE_PER_RAD = 240.0
 
 # ── Link lengths (metres) ─────────────────────────────────────────────────────
-DEFAULT_LINKS = [0.072, 0.104, 0.096, 0.046, 0.070]
+# Arm reach (excl. base) ≈ 36.3 cm.  Adjust for your arm.
+DEFAULT_LINKS = [0.072, 0.120, 0.110, 0.053, 0.080]
 #                base↑  shoulder  elbow   wrist   tool/gripper
 
 
@@ -211,4 +213,39 @@ def compute_cut_point(tomato_center_m, tomato_radius_m, arm_base):
     edge_point = center - direction * tomato_radius_m
     cut_gap = 0.01  # 1 cm
     cut_point = center - direction * (tomato_radius_m + cut_gap)
+    return edge_point, cut_point
+
+
+def compute_stem_cut_point(tomato_center_m, tomato_radius_m, arm_base,
+                           stem_up_offset=0.01):
+    """
+    Compute the cut point targeting the stem at the top of the tomato.
+
+    The stem is assumed to attach at the top (positive Z) of the tomato.
+    The end-effector approaches from the arm base direction but biased
+    upward to align the scissors with the stem.
+
+    Returns (stem_point, cut_point) both as numpy arrays.
+    """
+    center = np.array(tomato_center_m, dtype=float)
+    base = np.array(arm_base, dtype=float)
+
+    # Stem target: top of the tomato, slightly biased upward
+    stem_target = center.copy()
+    stem_target[2] += tomato_radius_m * 0.5  # bias toward stem
+
+    # Approach direction from base to stem target
+    direction = stem_target - base
+    dist = np.linalg.norm(direction)
+    if dist < 1e-6:
+        direction = np.array([1.0, 0.0, 0.0])
+    else:
+        direction = direction / dist
+
+    # Edge of tomato nearest to base
+    edge_point = center - direction * tomato_radius_m
+    # Cut point: 1 cm before the edge + upward stem bias
+    cut_point = center - direction * (tomato_radius_m + 0.01)
+    cut_point[2] += stem_up_offset  # offset upward toward stem
+
     return edge_point, cut_point

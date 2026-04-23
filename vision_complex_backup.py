@@ -33,8 +33,6 @@ from ultralytics import YOLO
 
 logger = logging.getLogger(__name__)
 
-ARM_REACH_CM = 36.0
-
 # ── Model path resolution ──────────────────────────────────────────────────────
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -429,12 +427,6 @@ class TomatoDetector:
         self.model = YOLO(self.model_path)
         self.confidence = confidence
         self.focal_length_px = focal_length_px
-        self.focal_length_x_px = float(os.getenv("TOMATO_FX_PX", focal_length_px))
-        self.focal_length_y_px = float(os.getenv("TOMATO_FY_PX", focal_length_px))
-        self.cx_offset_px = float(os.getenv("TOMATO_CX_OFFSET_PX", "0.0"))
-        self.cy_offset_px = float(os.getenv("TOMATO_CY_OFFSET_PX", "0.0"))
-        self.depth_scale = float(os.getenv("TOMATO_DEPTH_SCALE", "0.78"))
-        self.depth_bias_cm = float(os.getenv("TOMATO_DEPTH_BIAS_CM", "0.0"))
         self.real_diameter_cm = real_diameter_cm
         self.imgsz = imgsz
 
@@ -444,12 +436,6 @@ class TomatoDetector:
         self.min_aspect = 0.35
         self.max_aspect = 2.80
         self.min_red_ratio = 0.08
-
-        # Red-blob gates (explicit ball rejection)
-        self.min_blob_circularity = 0.55
-        self.max_blob_circularity = 0.93
-        self.min_blob_hue_std = 6.0
-        self.min_blob_sat_std = 18.0
 
         # HSV red ranges
         self._lo1 = np.array([0,   80,  50], dtype=np.uint8)
@@ -465,22 +451,18 @@ class TomatoDetector:
         self._ygreen_lo = np.array([20, 30, 25], dtype=np.uint8)
         self._ygreen_hi = np.array([35, 255, 255], dtype=np.uint8)
 
-        # Tomato-authenticity thresholds (tightened to reject red balls)
-        self.min_texture_var = 28.0       # Laplacian variance
-        self.min_calyx_ratio = 0.002      # green pixels in upper 40% of ROI
-        self.max_color_uniformity = 0.90  # too-uniform red → likely a ball
-        self.min_authenticity_score = 5   # out of 7 core checks
+        # Tomato-authenticity thresholds (relaxed for real-world conditions)
+        self.min_texture_var = 20.0       # Laplacian variance
+        self.min_calyx_ratio = 0.001      # green pixels in upper 40% of ROI
+        self.max_color_uniformity = 0.92  # too-uniform red → likely a ball
+        self.min_authenticity_score = 2   # out of 7 checks (relaxed)
 
         # Edge density thresholds
-        self.min_edge_density = 0.015     # real tomatoes have skin detail
-        self.max_specularity = 0.20       # balls have bright specular spots
+        self.min_edge_density = 0.01      # real tomatoes have skin detail
+        self.max_specularity = 0.25       # balls have bright specular spots
 
         # Ripeness: harvest stage 3+ (Pink, Light Red, Ripe)
         self.min_ripeness_stage = 3
-
-        # Performance knobs
-        self.snapshot_process_every_n = max(
-            1, int(os.getenv("TOMATO_SCAN_PROCESS_EVERY_N", "2")))
 
         # Temporal tracker
         self.tracker = TomatoTracker(
@@ -496,17 +478,7 @@ class TomatoDetector:
     def estimate_depth_cm(self, pixel_diameter):
         if pixel_diameter <= 0:
             return None
-        raw = (self.real_diameter_cm * self.focal_length_px) / pixel_diameter
-        return max(0.0, raw * self.depth_scale + self.depth_bias_cm)
-
-    def calibrate_focal_length(self, pixel_diameter, known_distance_cm):
-        """One-shot focal-length calibration from a known tomato distance."""
-        if pixel_diameter <= 0 or known_distance_cm <= 0:
-            raise ValueError("pixel_diameter and known_distance_cm must be > 0")
-        self.focal_length_px = float((pixel_diameter * known_distance_cm) / self.real_diameter_cm)
-        self.focal_length_x_px = self.focal_length_px
-        self.focal_length_y_px = self.focal_length_px
-        return self.focal_length_px
+        return (self.real_diameter_cm * self.focal_length_px) / pixel_diameter
 
     # ── Filters ────────────────────────────────────────────────────────────────
     def _passes_size_shape(self, x1, y1, x2, y2):
@@ -526,56 +498,6 @@ class TomatoDetector:
         mask |= cv2.inRange(hsv, self._lo2, self._hi2)
         ratio = np.count_nonzero(mask) / mask.size
         return ratio >= self.min_red_ratio
-
-    def _red_blob_metrics(self, roi_bgr):
-        """Return core blob metrics for geometry, texture, and depth sizing."""
-        hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-        red_mask = cv2.inRange(hsv, self._lo1, self._hi1)
-        red_mask |= cv2.inRange(hsv, self._lo2, self._hi2)
-
-        # Clean the mask so tiny speckles do not affect contour metrics.
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
-        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
-
-        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-
-        cnt = max(contours, key=cv2.contourArea)
-        area = float(cv2.contourArea(cnt))
-        perim = float(cv2.arcLength(cnt, True))
-        if area <= 1.0 or perim <= 1.0:
-            return None
-
-        circularity = float(min(1.0, 4.0 * math.pi * area / (perim * perim)))
-        eq_diameter_px = float(np.sqrt(4.0 * area / math.pi))
-
-        blob_pixels = hsv[red_mask > 0]
-        if blob_pixels.size == 0:
-            return None
-
-        hue_std = float(np.std(blob_pixels[:, 0].astype(np.float32)))
-        sat_std = float(np.std(blob_pixels[:, 1].astype(np.float32)))
-
-        return {
-            "mask": red_mask,
-            "area": area,
-            "circularity": circularity,
-            "eq_diameter_px": eq_diameter_px,
-            "hue_std": hue_std,
-            "sat_std": sat_std,
-        }
-
-    def _passes_blob_gates(self, metrics):
-        if metrics is None:
-            return False
-        if not (self.min_blob_circularity <= metrics["circularity"] <= self.max_blob_circularity):
-            return False
-        if metrics["hue_std"] < self.min_blob_hue_std and metrics["sat_std"] < self.min_blob_sat_std:
-            return False
-        return True
 
     # ── Tomato-authenticity checks (reject balls, cups, etc.) ──────────────
 
@@ -704,7 +626,7 @@ class TomatoDetector:
 
     def _is_authentic_tomato(self, roi_bgr):
         """Score-based tomato verification.  Returns (is_tomato, score, details).
-        A detection must pass at least `min_authenticity_score` of 7 core checks.
+        A detection must pass at least `min_authenticity_score` of 7 checks.
         
         Also applies hard-reject rules for obvious ball signatures:
           - No calyx + high circularity → instant reject
@@ -759,63 +681,37 @@ class TomatoDetector:
         if spec < self.max_specularity:
             score += 1
 
-        # Stem-scar heuristic is diagnostic only; not used for scoring because
-        # smooth objects can occasionally mimic this pattern under lighting.
-        stem_scar = self._stem_scar_detected(roi_bgr)
-        details["stem_scar"] = bool(stem_scar)
-
         details["score"] = f"{score}/7"
 
         # ── Hard-reject rules for obvious ball signatures ──
         # Rule A: No calyx + very circular = ball (tomatoes always have a stem)
         if not has_calyx and circ >= 0.90:
             details["hard_reject"] = "no_calyx+circular"
-            logger.debug(f"[FILTER] HARD REJECT (no calyx + circular={circ:.3f}): {details}")
+            logger.info(f"[FILTER] HARD REJECT (no calyx + circular={circ:.3f}): {details}")
             return False, score, details
 
         # Rule B: No calyx + uniform color + very low edges = artificial object
-        if not has_calyx and is_uniform and edge_dens < 0.008:
+        if not has_calyx and is_uniform and edge_dens < 0.005:
             details["hard_reject"] = "no_calyx+uniform+smooth"
-            logger.debug(f"[FILTER] HARD REJECT (no calyx + uniform + smooth): {details}")
+            logger.info(f"[FILTER] HARD REJECT (no calyx + uniform + smooth): {details}")
             return False, score, details
 
         # Rule C: Very high circularity + very uniform = ball regardless
-        if circ >= 0.93 and is_uniform:
+        if circ >= 0.95 and is_uniform:
             details["hard_reject"] = "perfect_circle+uniform"
-            logger.debug(f"[FILTER] HARD REJECT (perfect circle + uniform): {details}")
-            return False, score, details
-
-        # Rule D: No calyx and low hue diversity is a common red-ball signature.
-        if not has_calyx and diversity < 2:
-            details["hard_reject"] = "no_calyx+single_hue_band"
-            logger.debug(f"[FILTER] HARD REJECT (no calyx + single hue band): {details}")
-            return False, score, details
-
-        # Rule E: If calyx is absent, demand a stronger overall score.
-        if not has_calyx and score < 6:
-            details["hard_reject"] = "no_calyx+weak_score"
-            logger.debug(f"[FILTER] HARD REJECT (no calyx + weak score): {details}")
-            return False, score, details
-
-        # Rule F: Without calyx, require stronger non-color evidence to avoid
-        # confusing smooth red balls with tomatoes.
-        if not has_calyx and (circ > 0.40 or spec > 0.14):
-            details["hard_reject"] = "no_calyx+round_or_shiny"
-            logger.debug(f"[FILTER] HARD REJECT (no calyx + round/shiny): {details}")
+            logger.info(f"[FILTER] HARD REJECT (perfect circle + uniform): {details}")
             return False, score, details
 
         is_tomato = score >= self.min_authenticity_score
         if not is_tomato:
-            logger.debug(f"[FILTER] Rejected (score={score}/7): {details}")
+            logger.info(f"[FILTER] Rejected (score={score}/7): {details}")
         else:
-            logger.debug(f"[FILTER] Accepted (score={score}/7): {details}")
+            logger.info(f"[FILTER] Accepted (score={score}/7): {details}")
         return is_tomato, score, details
 
     def _pixel_to_xyz(self, cx, cy, z_cm, fw, fh):
-        cx0 = fw / 2.0 + self.cx_offset_px
-        cy0 = fh / 2.0 + self.cy_offset_px
-        x_cm = (cx - cx0) * z_cm / self.focal_length_x_px
-        y_cm = (cy - cy0) * z_cm / self.focal_length_y_px
+        x_cm = (cx - fw / 2.0) * z_cm / self.focal_length_px
+        y_cm = (cy - fh / 2.0) * z_cm / self.focal_length_px
         return round(x_cm, 2), round(y_cm, 2), round(z_cm, 2)
 
     # ── Fast detection (lightweight — for scan loops) ──────────────────────────
@@ -846,21 +742,13 @@ class TomatoDetector:
             if not self._passes_colour(roi):
                 continue
 
-            metrics = self._red_blob_metrics(roi)
-            if not self._passes_blob_gates(metrics):
-                continue
-
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            w = max(1, x2 - x1)
-            h = max(1, y2 - y1)
-            # Equivalent-area diameter is more stable than raw bbox width.
-            effective_diam_px = min(metrics["eq_diameter_px"], float(min(w, h)))
-            z_cm = self.estimate_depth_cm(effective_diam_px)
+            z_cm = self.estimate_depth_cm(x2 - x1)
             if z_cm is None:
                 continue
 
             x_cm, y_cm, z_cm = self._pixel_to_xyz(cx, cy, z_cm, fw, fh)
-            distance_cm = float(np.linalg.norm([x_cm, y_cm, z_cm]))
+            distance_cm = math.sqrt(x_cm**2 + y_cm**2 + z_cm**2)
 
             detections.append({
                 "confidence": round(conf, 3),
@@ -868,7 +756,6 @@ class TomatoDetector:
                 "center_px":  [cx, cy],
                 "xyz_cm":     {"x": x_cm, "y": y_cm, "z": z_cm},
                 "distance_cm": round(distance_cm, 2),
-                "reachable": bool(distance_cm <= ARM_REACH_CM),
             })
 
         detections.sort(key=lambda d: d["distance_cm"])
@@ -910,10 +797,6 @@ class TomatoDetector:
             if not self._passes_colour(roi):
                 continue
 
-            metrics = self._red_blob_metrics(roi)
-            if not self._passes_blob_gates(metrics):
-                continue
-
             # Verify this is a real tomato, not a ball or other red object
             is_tomato, auth_score, auth_details = self._is_authentic_tomato(roi)
             if not is_tomato:
@@ -924,20 +807,17 @@ class TomatoDetector:
 
             # Skip unripe tomatoes (harvest Pink, Light Red, and Ripe)
             if stage_idx < self.min_ripeness_stage:
-                logger.debug(f"[RIPENESS] Skipped: {stage_name} "
+                logger.info(f"[RIPENESS] Skipped: {stage_name} "
                             f"(stage {stage_idx}, red={red_ratio:.2f})")
                 continue
 
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            w = max(1, x2 - x1)
-            h = max(1, y2 - y1)
-            effective_diam_px = min(metrics["eq_diameter_px"], float(min(w, h)))
-            z_cm = self.estimate_depth_cm(effective_diam_px)
+            z_cm = self.estimate_depth_cm(x2 - x1)
             if z_cm is None:
                 continue
 
             x_cm, y_cm, z_cm = self._pixel_to_xyz(cx, cy, z_cm, fw, fh)
-            distance_cm = float(np.linalg.norm([x_cm, y_cm, z_cm]))
+            distance_cm = math.sqrt(x_cm**2 + y_cm**2 + z_cm**2)
 
             raw_detections.append({
                 "confidence": round(conf, 3),
@@ -945,7 +825,6 @@ class TomatoDetector:
                 "center_px":  [cx, cy],
                 "xyz_cm":     {"x": x_cm, "y": y_cm, "z": z_cm},
                 "distance_cm": round(distance_cm, 2),
-                "reachable": bool(distance_cm <= ARM_REACH_CM),
                 "authenticity": auth_details,
                 "ripeness_stage": stage_idx,
                 "ripeness_name": stage_name,
@@ -991,13 +870,7 @@ class TomatoDetector:
                 continue
 
             last_frame = frame
-            # Process every Nth frame to keep scan responsive on CPU.
-            if frame_count % self.snapshot_process_every_n != 0:
-                frame_count += 1
-                continue
-            # Use full detection here so scan confirmation includes
-            # authenticity/ripeness checks (not color-only fast filtering).
-            detections = self.detect(frame, use_tracker=False)
+            detections = self.detect_fast(frame)
             frame_count += 1
 
             for det in detections:
@@ -1019,7 +892,6 @@ class TomatoDetector:
                         }
                         cluster["max_conf"] = max(cluster["max_conf"],
                                                    det["confidence"])
-                        cluster["bbox_px"] = det.get("bbox_px", cluster.get("bbox_px"))
                         cluster["count"] += 1
                         merged = True
                         break
@@ -1028,7 +900,6 @@ class TomatoDetector:
                     clusters.append({
                         "avg_pos": dict(pos),
                         "max_conf": det["confidence"],
-                        "bbox_px": det.get("bbox_px"),
                         "count": 1,
                     })
 
@@ -1045,13 +916,11 @@ class TomatoDetector:
 
         logger.info(f"[SCAN] {frame_count} frames in {duration_s}s, "
                     f"{len(clusters)} clusters, {len(valid)} valid, "
-                f"returning top {min(max_tomatoes, len(valid))}; "
-                f"process_every_n={self.snapshot_process_every_n}")
+                    f"returning top {min(max_tomatoes, len(valid))}")
 
         return [
             {"xyz_cm": c["avg_pos"],
              "confidence": c["max_conf"],
-             "bbox_px": c.get("bbox_px"),
              "distance_cm": c["distance_cm"],
              "sightings": c["count"]}
             for c in valid[:max_tomatoes]

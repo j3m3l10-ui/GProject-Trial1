@@ -1,0 +1,42 @@
+import time
+from ros_robot_controller_sdk import Board
+from bus_servo_control import BusServoControl
+from arm_controller import SERVO_IDS, angles_to_pulses
+import numpy as np
+
+# Set target angles: base (ID 6) = 0, others -pi/2 except gripper (ID 1) = 0
+angles = np.array([0, -np.pi/2, -np.pi/2, -np.pi/2, 0], dtype=float)
+# Convert to pulses
+pulses = angles_to_pulses(angles)
+
+# Remove ID 2 if present (not used)
+if 2 in pulses:
+    del pulses[2]
+
+# Clamp to safe pulse ranges
+SAFE_PULSE_MIN = {1: 150, 3: 0, 4: 150, 5: 150, 6: 0}
+SAFE_PULSE_MAX = {1: 850, 3: 1000, 4: 850, 5: 850, 6: 1000}
+for sid in pulses:
+    pulses[sid] = max(SAFE_PULSE_MIN.get(sid, 0), min(SAFE_PULSE_MAX.get(sid, 1000), pulses[sid]))
+
+move_time = 8000  # ms, extra slow for safety
+
+board = Board()
+bsc = BusServoControl(board)
+
+print("[POSE] Moving base to 0 (front), others to -pi/2 (except ID 1 = 0) and holding...")
+for sid in SERVO_IDS:
+    if sid == 2:
+        continue
+    pulse = pulses[sid]
+    print(f"[POSE] Moving servo ID {sid} to pulse {pulse} with move_time={move_time} ms")
+    bsc.setBusServoPulse(sid, pulse, move_time)
+    time.sleep(0.1)
+time.sleep(move_time / 1000)
+
+print("[POSE] Holding position. Press Ctrl+C to exit.")
+try:
+    while True:
+        time.sleep(10)
+except KeyboardInterrupt:
+    print("[POSE] Exiting and releasing hold.")

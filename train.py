@@ -41,12 +41,17 @@ def main():
         label_smoothing=0.05, # prevents over-confident false positives
         # ── Augmentation ────────────────────────────────────────────────────
         hsv_h=0.015,          # hue jitter
-        hsv_s=0.7,            # saturation jitter — critical for colour robustness
-        hsv_v=0.4,            # brightness jitter
+        hsv_s=0.85,           # stronger saturation jitter for color robustness
+        hsv_v=0.55,           # stronger brightness jitter
         degrees=10.0,         # rotation
         flipud=0.5,
         fliplr=0.5,
+        scale=0.75,           # stronger scale variation
+        shear=5.0,            # affine shear perturbation
+        perspective=0.0008,   # mild perspective warp
         mosaic=1.0,           # mosaic on (default) — improves generalisation
+        mixup=0.20,           # blend samples to reduce color-only shortcuts
+        erasing=0.40,         # random erasing for robustness under clutter
         copy_paste=0.3,       # paste random tomatoes onto random backgrounds
         # ── Output ──────────────────────────────────────────────────────────
         project='runs/detect',
