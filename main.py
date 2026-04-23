@@ -38,7 +38,7 @@ import numpy as np
 from vision import TomatoDetector, ARM_REACH_CM
 from arm_controller import (
     FiveDOFArm, angles_to_pulses,
-    compute_stem_cut_point, SERVO_IDS,
+    SERVO_IDS,
 )
 from arm_home_position import get_home_pulses, get_home_angles
 from servo_driver import ServoDriver
@@ -60,28 +60,49 @@ SCAN_ANALYSIS_S      = 1.2    # seconds for heavy authenticity scan pass
 CONFIRM_DELAY_S      = 3.0    # seconds camera must confirm before arm moves
 MAX_HARVEST_PER_CYCLE = 3     # max tomatoes per harvest cycle
 MIN_SIGHTINGS        = 2      # min frames a tomato must appear in to be confirmed
-MOVE_DURATION_MS     = 800    # servo move duration for trajectory steps
+MOVE_DURATION_MS     = 2200   # slower trajectory timing for safer arm motion
 GRIPPER_DELAY_S      = 0.6    # wait after gripper close (cutting)
 RETRACT_DELAY_S      = 1.0    # wait after returning home
 TOMATO_RADIUS_M      = 0.035  # average tomato radius in metres
+STEM_VERTICAL_OFFSET_M = float(os.getenv("STEM_VERTICAL_OFFSET_M", "0.015"))
 CAMERA_INDEX         = 0      # default camera index
-TRAJ_STEPS_APPROACH  = 25     # interpolation steps for approach
-TRAJ_STEPS_RETRACT   = 30     # interpolation steps for retract to home
+TRAJ_STEPS_APPROACH  = 28     # more interpolation points for smoother approach
+TRAJ_STEPS_RETRACT   = 34     # more interpolation points for smoother retract
 LIVE_DETECT_EVERY_N  = 3      # run live overlay inference every N frames
 FRAME_DRAIN_COUNT    = 2      # flush stale buffered frames each iteration
 MIN_CLUSTER_FRAMES   = 2      # drop one-frame fluke targets
 ARM_MAX_REACH_FROM_CAMERA_M = 0.36  # hard physical limit from camera lens
+IK_ACCEPT_ERR_M     = 0.040   # accept near-solution if IK cannot fully converge
+IK_MAX_ITERS        = 500
 
 # ── Camera-to-arm transform ───────────────────────────────────────────────────
 # Hand-in-Eye: at Search Home the camera has a known pose relative to
 # the arm base.  CALIBRATE THESE VALUES on the real robot.
 # Arm reach is 36.3cm — camera is between wrist (ID3) and gripper (ID1),
-# roughly 8cm forward from base and 12cm above when at Search Home.
-CAMERA_OFFSET_M = np.array([0.08, 0.0, 0.12], dtype=float)
+# roughly a few cm forward from base and above when at Search Home.
+# Defaults are intentionally conservative; tune via env vars below.
+CAMERA_OFFSET_M = np.array([
+    float(os.getenv("CAMERA_OFFSET_X_M", "0.03")),
+    float(os.getenv("CAMERA_OFFSET_Y_M", "0.00")),
+    float(os.getenv("CAMERA_OFFSET_Z_M", "0.10")),
+], dtype=float)
 CAMERA_AXIS_SCALE = np.array([
     float(os.getenv("CAMERA_SCALE_X", "1.0")),
     float(os.getenv("CAMERA_SCALE_Y", "1.0")),
     float(os.getenv("CAMERA_SCALE_Z", "1.0")),
+], dtype=float)
+
+# Final target calibration in arm frame (post axis-map, pre-offset).
+# Useful for correcting systematic real-world bias without code edits.
+ARM_TARGET_SCALE = np.array([
+    float(os.getenv("ARM_TARGET_SCALE_X", "0.90")),
+    float(os.getenv("ARM_TARGET_SCALE_Y", "1.00")),
+    float(os.getenv("ARM_TARGET_SCALE_Z", "1.00")),
+], dtype=float)
+ARM_TARGET_BIAS_M = np.array([
+    float(os.getenv("ARM_TARGET_BIAS_X_M", "0.00")),
+    float(os.getenv("ARM_TARGET_BIAS_Y_M", "0.00")),
+    float(os.getenv("ARM_TARGET_BIAS_Z_M", "0.00")),
 ], dtype=float)
 
 
@@ -111,7 +132,8 @@ def camera_to_arm_frame(xyz_cm_dict):
     # Base mapping: Camera Z ≈ arm X, camera X ≈ arm -Y, camera Y ≈ arm -Z
     arm_nominal = np.array([cam[2], -cam[0], -cam[1]], dtype=float)
     arm_rot = CAM_TO_ARM_FINE_ROT @ arm_nominal
-    return arm_rot + CAMERA_OFFSET_M
+    arm_cal = arm_rot * ARM_TARGET_SCALE + ARM_TARGET_BIAS_M
+    return arm_cal + CAMERA_OFFSET_M
 
 
 def camera_distance_m(xyz_cm_dict):
@@ -140,6 +162,68 @@ def _project_to_reachable(target_m, arm, safety_margin_m=0.02):
     return projected, True
 
 
+def _stem_cut_point_from_center(target_m, arm):
+    """Target stem by moving vertically above tomato center by 1-2 cm."""
+    cut_pt = np.array(target_m, dtype=float).copy()
+    cut_pt[2] += STEM_VERTICAL_OFFSET_M
+    cut_pt, was_projected = _project_to_reachable(cut_pt, arm)
+    return cut_pt, was_projected
+
+
+def _solve_ik_with_fallback(arm, q_current, target_m, cut_pt):
+    """Try IK on stem target with safe retries around the target.
+
+    Returns (accepted, solved_flag, err, iters, q_solution, used_target).
+    """
+    target_m = np.array(target_m, dtype=float)
+    cut_pt = np.array(cut_pt, dtype=float)
+
+    # Build conservative fallback targets around the stem point.
+    retry_points = [
+        cut_pt,
+        target_m + np.array([0.0, 0.0, max(0.008, STEM_VERTICAL_OFFSET_M * 0.5)]),
+        target_m,
+        target_m + np.array([0.0, 0.0, -0.010]),
+    ]
+
+    # Also try slight pullback toward base to avoid kinematic boundary lock.
+    base = np.array(arm.base_pos, dtype=float)
+    vec = target_m - base
+    dist = float(np.linalg.norm(vec))
+    if dist > 1e-9:
+        backoff = target_m - (vec / dist) * 0.015
+        retry_points.append(backoff)
+
+    best = {
+        "accepted": False,
+        "solved": False,
+        "err": 1e9,
+        "iters": IK_MAX_ITERS,
+        "q": np.array(q_current, dtype=float).copy(),
+        "target": cut_pt,
+    }
+
+    for p in retry_points:
+        p, _ = _project_to_reachable(p, arm)
+        arm.set_joint_angles(q_current)
+        solved, err, iters = arm.inverse_kinematics(p, max_iters=IK_MAX_ITERS, tol=8e-4)
+        q_try = arm.joint_angles.copy()
+
+        if err < best["err"]:
+            best.update({
+                "solved": solved,
+                "err": float(err),
+                "iters": int(iters),
+                "q": q_try,
+                "target": p,
+            })
+
+        if solved or err <= IK_ACCEPT_ERR_M:
+            return True, solved, float(err), int(iters), q_try, p
+
+    return best["accepted"], best["solved"], best["err"], best["iters"], best["q"], best["target"]
+
+
 # ── Trajectory interpolation ──────────────────────────────────────────────────
 def interpolate_trajectory(q_start, q_end, steps=20):
     """Linear joint-space interpolation."""
@@ -161,10 +245,10 @@ def execute_trajectory(arm, driver, q_start, q_end, steps, duration_ms):
     backend = getattr(driver, "_backend", "")
     if backend.startswith("i2c"):
         steps = max(4, min(int(steps), 10))
-        min_step_ms = 120
+        min_step_ms = 180
     else:
         steps = max(4, int(steps))
-        min_step_ms = 40
+        min_step_ms = 80
 
     traj = interpolate_trajectory(q_start, q_end, steps)
     step_duration = max(min_step_ms, duration_ms // steps)
@@ -192,7 +276,7 @@ def execute_trajectory(arm, driver, q_start, q_end, steps, duration_ms):
 
     # Final absolute settle command ensures the last pose is reached on relay boards.
     arm.set_joint_angles(q_end)
-    driver.move_servos(end_pulses, duration_ms=max(200, step_duration * 2))
+    driver.move_servos(end_pulses, duration_ms=max(320, step_duration * 2))
     time.sleep(max(0.2, step_sleep))
 
 
@@ -225,10 +309,8 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total):
             f"[{target_m[0]:.3f}, {target_m[1]:.3f}, {target_m[2]:.3f}]m"
         )
 
-    # Compute stem cut point (above the tomato)
-    stem_pt, cut_pt = compute_stem_cut_point(target_m, TOMATO_RADIUS_M,
-                                              arm.base_pos)
-    cut_pt, cut_projected = _project_to_reachable(cut_pt, arm)
+    # Compute stem cut point as center + vertical offset (1-2 cm up).
+    cut_pt, cut_projected = _stem_cut_point_from_center(target_m, arm)
     if cut_projected:
         logger.warning(
             f"[{index+1}/{total}] Cut point adjusted to reachable point: "
@@ -241,23 +323,28 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total):
     q_current = arm.joint_angles.copy()
 
     # Open gripper before approach
-    if DRY_RUN:
-        _log_dry_run(f"[{index+1}/{total}] Opening gripper (400ms)")
-    else:
-        driver.gripper_open(duration_ms=400)
+    _ensure_gripper_open(driver, duration_ms=450)
     time.sleep(0.4)
 
-    # Solve IK for cut point
-    arm.set_joint_angles(q_current)
-    solved, err, iters = arm.inverse_kinematics(cut_pt, max_iters=400, tol=5e-4)
-    q_cut = arm.joint_angles.copy()
-    logger.info(f"[{index+1}/{total}] IK: solved={solved}, "
-                f"err={err:.4f}m, iters={iters}")
+    # Solve IK for cut point with robust fallback near the stem region.
+    accepted, solved, err, iters, q_cut, used_target = _solve_ik_with_fallback(
+        arm, q_current, target_m, cut_pt
+    )
+    logger.info(
+        f"[{index+1}/{total}] IK: solved={solved}, err={err:.4f}m, iters={iters}, "
+        f"accepted={accepted}"
+    )
 
-    if not solved and err > 0.02:
-        logger.warning(f"[{index+1}/{total}] IK error too large — skipping")
+    if not accepted:
+        logger.warning(f"[{index+1}/{total}] IK failed after fallback retries — skipping")
         arm.set_joint_angles(q_current)
         return False
+
+    if np.linalg.norm(np.array(used_target) - np.array(cut_pt)) > 1e-6:
+        logger.warning(
+            f"[{index+1}/{total}] Using fallback cut target: "
+            f"[{used_target[0]:.3f}, {used_target[1]:.3f}, {used_target[2]:.3f}]m"
+        )
 
     # Move: current position → cut point
     logger.info(f"[{index+1}/{total}] Approaching stem...")
@@ -272,21 +359,24 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total):
     # Close gripper / scissors to cut the stem
     logger.info(f"[{index+1}/{total}] {'[SKIPPED-DRY-RUN/NO-CUT]' if DRY_RUN or NO_CUT else 'CUTTING'} stem...")
     if not (DRY_RUN or NO_CUT):
-        if _user_confirm(f"READY TO CUT STEM for tomato #{index+1}. Proceed?", 
-                        default_yes=False):
+        if _user_confirm(f"READY TO CUT STEM for tomato #{index+1}. Proceed?",
+                        default_yes=True):
             driver.gripper_close(duration_ms=500)
             time.sleep(GRIPPER_DELAY_S)
             logger.info(f"[{index+1}/{total}] Cut complete!")
-            driver.gripper_open(duration_ms=400)
+            _ensure_gripper_open(driver, duration_ms=450)
             time.sleep(0.3)
         else:
             logger.warning(f"[{index+1}/{total}] Cut cancelled by user — skipping")
+            _ensure_gripper_open(driver, duration_ms=450)
             return False
     else:
         if DRY_RUN:
             _log_dry_run(f"[{index+1}/{total}] Closing gripper (500ms)")
             time.sleep(0.5)
-            _log_dry_run(f"[{index+1}/{total}] Opening gripper (400ms)")
+            _log_dry_run(f"[{index+1}/{total}] Opening gripper (450ms)")
+        else:
+            _ensure_gripper_open(driver, duration_ms=450)
         time.sleep(0.3)
 
     return True
@@ -324,6 +414,14 @@ def _log_dry_run(message):
     """Log message with [DRY RUN] prefix if in dry-run mode."""
     if DRY_RUN:
         logger.info(f"[DRY RUN] {message}")
+
+
+def _ensure_gripper_open(driver, duration_ms=450):
+    """Force end effector open state for safe approach and return."""
+    if DRY_RUN:
+        _log_dry_run(f"Ensuring gripper OPEN ({duration_ms}ms)")
+        return
+    driver.gripper_open(duration_ms=duration_ms)
 
 
 def _drain_camera_frames(cap, count=FRAME_DRAIN_COUNT):
@@ -459,8 +557,12 @@ def run_harvesting(sim_mode=False):
         logger.info("SINGLE PASS MODE — Will run 1 cycle then exit")
     if TEST_CYCLES:
         logger.info(f"TEST MODE — Limiting to {TEST_CYCLES} cycle(s)")
-    logger.info(f"3D mapping: CAMERA_OFFSET_M={CAMERA_OFFSET_M.tolist()}, "
-                f"CAMERA_AXIS_SCALE={CAMERA_AXIS_SCALE.tolist()}")
+    logger.info(
+        f"3D mapping: CAMERA_OFFSET_M={CAMERA_OFFSET_M.tolist()}, "
+        f"CAMERA_AXIS_SCALE={CAMERA_AXIS_SCALE.tolist()}, "
+        f"ARM_TARGET_SCALE={ARM_TARGET_SCALE.tolist()}, "
+        f"ARM_TARGET_BIAS_M={ARM_TARGET_BIAS_M.tolist()}"
+    )
 
     # Initialise subsystems
     detector = TomatoDetector(imgsz=416)
@@ -473,7 +575,7 @@ def run_harvesting(sim_mode=False):
     logger.info("Moving arm to home base position...")
     if not DRY_RUN:
         arm.set_joint_angles(home_angles)
-        driver.move_servos(home_pulses, duration_ms=2000)
+        driver.move_servos(home_pulses, duration_ms=3500)
     else:
         _log_dry_run(f"Setting arm to home: [{', '.join([f'{a:.2f}' for a in home_angles])}]")
     time.sleep(2.5)
@@ -498,8 +600,9 @@ def run_harvesting(sim_mode=False):
             # ── Phase 1: SCAN ──────────────────────────────────────────────
             # Ensure arm is at saved home base so camera can see the workspace
             if not DRY_RUN:
+                _ensure_gripper_open(driver, duration_ms=450)
                 arm.set_joint_angles(home_angles)
-                driver.move_servos(home_pulses, duration_ms=800)
+                driver.move_servos(home_pulses, duration_ms=1800)
             else:
                 _log_dry_run("Resetting arm to home base for scan")
             time.sleep(1.0)
@@ -545,12 +648,13 @@ def run_harvesting(sim_mode=False):
             logger.info(f"\n{harvested}/{n} tomatoes harvested. "
                         f"Returning to home base...")
             if not DRY_RUN:
+                _ensure_gripper_open(driver, duration_ms=450)
                 q_current = arm.joint_angles.copy()
                 execute_trajectory(arm, driver, q_current, home_angles,
                                    steps=TRAJ_STEPS_RETRACT,
                                    duration_ms=MOVE_DURATION_MS)
                 arm.set_joint_angles(home_angles)
-                driver.move_servos(home_pulses, duration_ms=800)
+                driver.move_servos(home_pulses, duration_ms=1800)
             else:
                 _log_dry_run("Returning arm to home base")
             time.sleep(RETRACT_DELAY_S)
@@ -572,7 +676,8 @@ def run_harvesting(sim_mode=False):
         # Safe shutdown: park all servos
         logger.info("Parking arm (safe shutdown)...")
         if not DRY_RUN:
-            driver.go_park(duration_ms=1200)
+            _ensure_gripper_open(driver, duration_ms=450)
+            driver.go_park(duration_ms=2200)
             time.sleep(1.5)
         else:
             _log_dry_run("Parking arm")
@@ -630,7 +735,7 @@ def main():
         
         if not DRY_RUN:
             arm.set_joint_angles(home_angles)
-            driver.move_servos(home_pulses, duration_ms=2000)
+            driver.move_servos(home_pulses, duration_ms=3500)
         else:
             _log_dry_run(f"Setting arm to home: [{', '.join([f'{a:.2f}' for a in home_angles])}]")
         time.sleep(2.5)
@@ -666,17 +771,31 @@ def main():
                         )
                         continue
                     target_m = camera_to_arm_frame(xyz_cm)
-                    if not arm.is_reachable(target_m):
-                        logger.warning(f"[WARN] Target {target_m} out of reach, skipping.")
-                        continue
-                    stem_pt, cut_pt = compute_stem_cut_point(target_m, TOMATO_RADIUS_M, arm.base_pos)
+                    target_m, was_projected = _project_to_reachable(target_m, arm)
+                    if was_projected:
+                        logger.warning(
+                            f"[WARN] Target outside reach; projecting to {target_m.tolist()}"
+                        )
+                    cut_pt, cut_projected = _stem_cut_point_from_center(target_m, arm)
+                    if cut_projected:
+                        logger.warning(
+                            f"[WARN] Cut point projected to reachable point: {cut_pt.tolist()}"
+                        )
                     q_current = arm.joint_angles.copy()
-                    if not DRY_RUN:
-                        arm.set_joint_angles(q_current)
-                    solved, err, iters = arm.inverse_kinematics(cut_pt, max_iters=400, tol=5e-4)
-                    q_cut = arm.joint_angles.copy()
-                    if not solved and err > 0.02:
-                        logger.warning(f"[WARN] IK error too large, skipping.")
+                    if DRY_RUN:
+                        _log_dry_run(f"[INFO] Tomato #{i+1}: Opening gripper (450ms)")
+                    else:
+                        _ensure_gripper_open(driver, duration_ms=450)
+                    time.sleep(0.4)
+                    accepted, solved, err, iters, q_cut, used_target = _solve_ik_with_fallback(
+                        arm, q_current, target_m, cut_pt
+                    )
+                    logger.info(
+                        f"[INFO] Tomato #{i+1} IK: solved={solved}, err={err:.4f}m, "
+                        f"iters={iters}, accepted={accepted}"
+                    )
+                    if not accepted:
+                        logger.warning(f"[WARN] IK fallback failed, skipping.")
                         if not DRY_RUN:
                             arm.set_joint_angles(q_current)
                         continue
@@ -691,25 +810,27 @@ def main():
                         logger.info(f"[INFO] CUTTING stem of tomato #{i+1}...")
                         driver.gripper_close(duration_ms=500)
                         time.sleep(GRIPPER_DELAY_S)
-                        driver.gripper_open(duration_ms=400)
+                        _ensure_gripper_open(driver, duration_ms=450)
                     else:
                         if DRY_RUN:
                             _log_dry_run(f"[INFO] Tomato #{i+1}: Closing gripper (500ms)")
                             time.sleep(0.5)
-                            _log_dry_run(f"[INFO] Tomato #{i+1}: Opening gripper (400ms)")
+                            _log_dry_run(f"[INFO] Tomato #{i+1}: Opening gripper (450ms)")
                         elif NO_CUT:
                             logger.info(f"[INFO] Tomato #{i+1}: [NO-CUT MODE] Skipping cut")
+                            _ensure_gripper_open(driver, duration_ms=450)
                     
                     time.sleep(0.3)
                     logger.info(f"[INFO] Tomato #{i+1} processed.")
                 
                 logger.info("[INFO] Returning to home position...")
                 if not DRY_RUN:
+                    _ensure_gripper_open(driver, duration_ms=450)
                     q_current = arm.joint_angles.copy()
                     execute_trajectory(arm, driver, q_current, home_angles, 
                                      steps=TRAJ_STEPS_RETRACT, duration_ms=MOVE_DURATION_MS)
                     arm.set_joint_angles(home_angles)
-                    driver.move_servos(home_pulses, duration_ms=800)
+                    driver.move_servos(home_pulses, duration_ms=1800)
                 else:
                     _log_dry_run("Returning arm to home position")
                 time.sleep(RETRACT_DELAY_S)
@@ -721,7 +842,8 @@ def main():
                 time.sleep(1)
         
         if not DRY_RUN:
-            driver.go_park(duration_ms=1200)
+            _ensure_gripper_open(driver, duration_ms=450)
+            driver.go_park(duration_ms=2200)
             time.sleep(1.5)
         else:
             _log_dry_run("Parking arm")

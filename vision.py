@@ -446,10 +446,10 @@ class TomatoDetector:
         self.min_red_ratio = 0.08
 
         # Red-blob gates (explicit ball rejection)
-        self.min_blob_circularity = 0.55
-        self.max_blob_circularity = 0.93
-        self.min_blob_hue_std = 6.0
-        self.min_blob_sat_std = 18.0
+        self.min_blob_circularity = 0.35
+        self.max_blob_circularity = 0.97
+        self.min_blob_hue_std = 4.0
+        self.min_blob_sat_std = 12.0
 
         # HSV red ranges
         self._lo1 = np.array([0,   80,  50], dtype=np.uint8)
@@ -466,17 +466,17 @@ class TomatoDetector:
         self._ygreen_hi = np.array([35, 255, 255], dtype=np.uint8)
 
         # Tomato-authenticity thresholds (tightened to reject red balls)
-        self.min_texture_var = 28.0       # Laplacian variance
+        self.min_texture_var = 18.0       # Laplacian variance
         self.min_calyx_ratio = 0.002      # green pixels in upper 40% of ROI
         self.max_color_uniformity = 0.90  # too-uniform red → likely a ball
-        self.min_authenticity_score = 5   # out of 7 core checks
+        self.min_authenticity_score = 4   # out of 7 core checks
 
         # Edge density thresholds
-        self.min_edge_density = 0.015     # real tomatoes have skin detail
+        self.min_edge_density = 0.010     # real tomatoes have skin detail
         self.max_specularity = 0.20       # balls have bright specular spots
 
         # Ripeness: harvest stage 3+ (Pink, Light Red, Ripe)
-        self.min_ripeness_stage = 3
+        self.min_ripeness_stage = 2
 
         # Performance knobs
         self.snapshot_process_every_n = max(
@@ -485,7 +485,7 @@ class TomatoDetector:
         # Temporal tracker
         self.tracker = TomatoTracker(
             max_missing_frames=8,
-            min_hits=3,
+            min_hits=2,
             match_distance_px=80,
         )
 
@@ -792,14 +792,14 @@ class TomatoDetector:
             return False, score, details
 
         # Rule E: If calyx is absent, demand a stronger overall score.
-        if not has_calyx and score < 6:
+        if not has_calyx and score < 5:
             details["hard_reject"] = "no_calyx+weak_score"
             logger.debug(f"[FILTER] HARD REJECT (no calyx + weak score): {details}")
             return False, score, details
 
         # Rule F: Without calyx, require stronger non-color evidence to avoid
         # confusing smooth red balls with tomatoes.
-        if not has_calyx and (circ > 0.40 or spec > 0.14):
+        if not has_calyx and (circ > 0.88 and spec > 0.18):
             details["hard_reject"] = "no_calyx+round_or_shiny"
             logger.debug(f"[FILTER] HARD REJECT (no calyx + round/shiny): {details}")
             return False, score, details
