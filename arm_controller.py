@@ -55,6 +55,21 @@ def rodrigues(axis, theta):
     ], dtype=float)
 
 
+def _point_to_segment_distance(point, seg_start, seg_end):
+    """Shortest distance from a point to a line segment in 3D."""
+    point = np.asarray(point, dtype=float)
+    seg_start = np.asarray(seg_start, dtype=float)
+    seg_end = np.asarray(seg_end, dtype=float)
+    seg = seg_end - seg_start
+    seg_len_sq = float(np.dot(seg, seg))
+    if seg_len_sq < 1e-12:
+        return float(np.linalg.norm(point - seg_start))
+    t = float(np.dot(point - seg_start, seg) / seg_len_sq)
+    t = max(0.0, min(1.0, t))
+    closest = seg_start + t * seg
+    return float(np.linalg.norm(point - closest))
+
+
 class FiveDOFArm:
     """5-DOF robotic arm with forward kinematics, numerical Jacobian, and DLS IK."""
 
@@ -130,26 +145,216 @@ class FiveDOFArm:
             J[:, j] = (self.end_effector_pos(q + dq) - f0) / eps
         return J
 
+    def _heuristic_seed(self, target, elbow_sign=-1.0):
+        """Planar geometric seed to help the Jacobian solver converge."""
+        target = np.asarray(target, dtype=float)
+        q = np.zeros(5, dtype=float)
+        q[0] = math.atan2(target[1], target[0])
+
+        radial = math.hypot(target[0], target[1])
+        z = target[2] - self.link_lengths[0]
+        l1 = float(self.link_lengths[1])
+        l2 = float(self.link_lengths[2] + self.link_lengths[3] + self.link_lengths[4])
+        dist = math.hypot(radial, z)
+        dist = max(1e-6, min(dist, l1 + l2 - 1e-6))
+
+        cos_elbow = (dist * dist - l1 * l1 - l2 * l2) / (2.0 * l1 * l2)
+        cos_elbow = max(-1.0, min(1.0, cos_elbow))
+        elbow = elbow_sign * math.acos(cos_elbow)
+        shoulder = math.atan2(z, radial) - math.atan2(
+            l2 * math.sin(elbow),
+            l1 + l2 * math.cos(elbow),
+        )
+        wrist = -(shoulder + elbow)
+        q[1] = shoulder
+        q[2] = elbow
+        q[3] = wrist
+        self.set_joint_angles(q)
+        return self.joint_angles.copy()
+
+    def link_clearance(self, point, joint_angles=None, ignore_last_segments=1):
+        """Minimum distance from arm links to a point obstacle."""
+        positions, _ = self.forward_kinematics(joint_angles)
+        segment_count = len(positions) - 1
+        active_segments = max(0, segment_count - int(ignore_last_segments))
+        distances = []
+        for idx in range(active_segments):
+            distances.append(_point_to_segment_distance(
+                point, positions[idx], positions[idx + 1]))
+        if not distances:
+            return float("inf")
+        return float(min(distances))
+
+    def _collision_cost(self, joint_angles, obstacle_center, obstacle_radius,
+                        clearance=0.015, ignore_last_segments=1):
+        if obstacle_center is None or obstacle_radius <= 0.0:
+            return 0.0
+        min_dist = self.link_clearance(
+            obstacle_center,
+            joint_angles=joint_angles,
+            ignore_last_segments=ignore_last_segments,
+        )
+        safe_dist = float(obstacle_radius) + float(clearance)
+        if min_dist >= safe_dist:
+            return 0.0
+        deficit = safe_dist - min_dist
+        return float(deficit * deficit)
+
+    def avoidance_gradient(self, joint_angles, obstacle_center, obstacle_radius,
+                           clearance=0.015, eps=1e-4,
+                           ignore_last_segments=1):
+        """Finite-difference gradient of the collision penalty."""
+        q = np.array(joint_angles, dtype=float).copy()
+        grad = np.zeros_like(q)
+        base_cost = self._collision_cost(
+            q,
+            obstacle_center,
+            obstacle_radius,
+            clearance=clearance,
+            ignore_last_segments=ignore_last_segments,
+        )
+        if base_cost <= 0.0:
+            return grad
+        for idx in range(len(q)):
+            dq = np.zeros_like(q)
+            dq[idx] = eps
+            q_plus = q + dq
+            q_minus = q - dq
+            q_plus[idx] = np.clip(q_plus[idx], self.joint_limits[idx, 0], self.joint_limits[idx, 1])
+            q_minus[idx] = np.clip(q_minus[idx], self.joint_limits[idx, 0], self.joint_limits[idx, 1])
+            c_plus = self._collision_cost(
+                q_plus,
+                obstacle_center,
+                obstacle_radius,
+                clearance=clearance,
+                ignore_last_segments=ignore_last_segments,
+            )
+            c_minus = self._collision_cost(
+                q_minus,
+                obstacle_center,
+                obstacle_radius,
+                clearance=clearance,
+                ignore_last_segments=ignore_last_segments,
+            )
+            grad[idx] = (c_plus - c_minus) / (2.0 * eps)
+        return grad
+
     # ── Damped Least-Squares IK ────────────────────────────────────────────────
-    def inverse_kinematics(self, target, max_iters=300, tol=5e-4, lam=1e-2):
+    def _ik_refine(self, target, seed, max_iters=300, tol=5e-4, lam=1e-2,
+                   obstacle_center=None, obstacle_radius=0.0,
+                   obstacle_clearance=0.015, avoid_gain=0.12,
+                   joint_center_gain=0.02, max_step=0.18):
         target = np.array(target, dtype=float)
-        q = self.joint_angles.copy()
+        q = np.array(seed, dtype=float).copy()
+        q_mid = np.mean(self.joint_limits, axis=1)
+        q_span = np.maximum(self.joint_limits[:, 1] - self.joint_limits[:, 0], 1e-6)
         for it in range(max_iters):
             err_vec = target - self.end_effector_pos(q)
             err_norm = np.linalg.norm(err_vec)
-            if err_norm < tol:
-                self.set_joint_angles(q)
-                return True, err_norm, it
+            collision_cost = self._collision_cost(
+                q,
+                obstacle_center,
+                obstacle_radius,
+                clearance=obstacle_clearance,
+            )
+            if err_norm < tol and collision_cost <= 1e-8:
+                return True, err_norm, it, q.copy()
             J = self.jacobian(q)
             A = J @ J.T + (lam ** 2) * np.eye(3)
-            dq = J.T @ np.linalg.solve(A, err_vec)
-            q += dq
-            for i in range(len(q)):
-                q[i] = np.clip(q[i], self.joint_limits[i, 0],
-                                self.joint_limits[i, 1])
-        self.set_joint_angles(q)
-        final_err = np.linalg.norm(target - self.end_effector_pos())
-        return False, final_err, max_iters
+            J_pinv = J.T @ np.linalg.solve(A, np.eye(3))
+            dq_primary = J_pinv @ err_vec
+
+            secondary = -joint_center_gain * (q - q_mid) / (q_span * q_span)
+            if obstacle_center is not None and obstacle_radius > 0.0:
+                secondary -= avoid_gain * self.avoidance_gradient(
+                    q,
+                    obstacle_center,
+                    obstacle_radius,
+                    clearance=obstacle_clearance,
+                )
+
+            nullspace = np.eye(len(q)) - J_pinv @ J
+            dq = dq_primary + nullspace @ secondary
+            dq_norm = float(np.linalg.norm(dq))
+            if dq_norm > max_step:
+                dq *= max_step / dq_norm
+
+            current_cost = err_norm + collision_cost
+            accepted = False
+            for step_scale in (1.0, 0.5, 0.25, 0.1):
+                q_candidate = q + dq * step_scale
+                for i in range(len(q_candidate)):
+                    q_candidate[i] = np.clip(
+                        q_candidate[i],
+                        self.joint_limits[i, 0],
+                        self.joint_limits[i, 1],
+                    )
+                candidate_err = np.linalg.norm(target - self.end_effector_pos(q_candidate))
+                candidate_cost = candidate_err + self._collision_cost(
+                    q_candidate,
+                    obstacle_center,
+                    obstacle_radius,
+                    clearance=obstacle_clearance,
+                )
+                if candidate_cost <= current_cost or candidate_err < err_norm:
+                    q = q_candidate
+                    accepted = True
+                    break
+            if not accepted:
+                q = q + 0.1 * dq_primary
+                for i in range(len(q)):
+                    q[i] = np.clip(q[i], self.joint_limits[i, 0],
+                                   self.joint_limits[i, 1])
+        final_err = np.linalg.norm(target - self.end_effector_pos(q))
+        return False, final_err, max_iters, q.copy()
+
+    def inverse_kinematics(self, target, max_iters=300, tol=5e-4, lam=1e-2,
+                           obstacle_center=None, obstacle_radius=0.0,
+                           obstacle_clearance=0.015, avoid_gain=0.12,
+                           joint_center_gain=0.02, max_step=0.18):
+        target = np.array(target, dtype=float)
+        q_mid = np.mean(self.joint_limits, axis=1)
+        seeds = [
+            self.joint_angles.copy(),
+            self._heuristic_seed(target, elbow_sign=-1.0),
+            self._heuristic_seed(target, elbow_sign=1.0),
+            q_mid,
+        ]
+
+        best = {
+            "solved": False,
+            "err": float("inf"),
+            "iters": max_iters,
+            "q": self.joint_angles.copy(),
+        }
+
+        for seed in seeds:
+            solved, err, iters, q_sol = self._ik_refine(
+                target,
+                seed,
+                max_iters=max_iters,
+                tol=tol,
+                lam=lam,
+                obstacle_center=obstacle_center,
+                obstacle_radius=obstacle_radius,
+                obstacle_clearance=obstacle_clearance,
+                avoid_gain=avoid_gain,
+                joint_center_gain=joint_center_gain,
+                max_step=max_step,
+            )
+            if err < best["err"]:
+                best.update({
+                    "solved": solved,
+                    "err": err,
+                    "iters": iters,
+                    "q": q_sol,
+                })
+            if solved:
+                self.set_joint_angles(q_sol)
+                return True, err, iters
+
+        self.set_joint_angles(best["q"])
+        return False, best["err"], best["iters"]
 
     # ── Workspace reach check ──────────────────────────────────────────────────
     def max_reach(self):

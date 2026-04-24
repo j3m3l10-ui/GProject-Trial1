@@ -433,7 +433,7 @@ class TomatoDetector:
         self.focal_length_y_px = float(os.getenv("TOMATO_FY_PX", focal_length_px))
         self.cx_offset_px = float(os.getenv("TOMATO_CX_OFFSET_PX", "0.0"))
         self.cy_offset_px = float(os.getenv("TOMATO_CY_OFFSET_PX", "0.0"))
-        self.depth_scale = float(os.getenv("TOMATO_DEPTH_SCALE", "0.78"))
+        self.depth_scale = float(os.getenv("TOMATO_DEPTH_SCALE", "1.00"))
         self.depth_bias_cm = float(os.getenv("TOMATO_DEPTH_BIAS_CM", "0.0"))
         self.real_diameter_cm = real_diameter_cm
         self.imgsz = imgsz

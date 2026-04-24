@@ -65,6 +65,7 @@ GRIPPER_DELAY_S      = 0.6    # wait after gripper close (cutting)
 RETRACT_DELAY_S      = 1.0    # wait after returning home
 TOMATO_RADIUS_M      = 0.035  # average tomato radius in metres
 STEM_VERTICAL_OFFSET_M = float(os.getenv("STEM_VERTICAL_OFFSET_M", "0.015"))
+CUT_GRIPPER_CLOSE_MS = int(os.getenv("CUT_GRIPPER_CLOSE_MS", "220"))
 CAMERA_INDEX         = 0      # default camera index
 TRAJ_STEPS_APPROACH  = 28     # more interpolation points for smoother approach
 TRAJ_STEPS_RETRACT   = 34     # more interpolation points for smoother retract
@@ -72,8 +73,14 @@ LIVE_DETECT_EVERY_N  = 3      # run live overlay inference every N frames
 FRAME_DRAIN_COUNT    = 2      # flush stale buffered frames each iteration
 MIN_CLUSTER_FRAMES   = 2      # drop one-frame fluke targets
 ARM_MAX_REACH_FROM_CAMERA_M = 0.36  # hard physical limit from camera lens
-IK_ACCEPT_ERR_M     = 0.040   # accept near-solution if IK cannot fully converge
+IK_ACCEPT_ERR_M     = 0.020   # accept near-solution if IK cannot fully converge
 IK_MAX_ITERS        = 500
+IK_OBSTACLE_CLEARANCE_M = float(os.getenv("IK_OBSTACLE_CLEARANCE_M", "0.015"))
+STEM_DEPTH_BRACKET_M = float(os.getenv("STEM_DEPTH_BRACKET_M", "0.000"))
+STEM_LATERAL_BRACKET_M = float(os.getenv("STEM_LATERAL_BRACKET_M", "0.000"))
+PREMOVE_REFINE_S = float(os.getenv("PREMOVE_REFINE_S", "0.9"))
+PREMOVE_REFINE_MAX_DELTA_CM = float(os.getenv("PREMOVE_REFINE_MAX_DELTA_CM", "12.0"))
+PREMOVE_REFINE_MIN_HITS = int(os.getenv("PREMOVE_REFINE_MIN_HITS", "2"))
 
 # ── Camera-to-arm transform ───────────────────────────────────────────────────
 # Hand-in-Eye: at Search Home the camera has a known pose relative to
@@ -93,17 +100,25 @@ CAMERA_AXIS_SCALE = np.array([
 ], dtype=float)
 
 # Final target calibration in arm frame (post axis-map, pre-offset).
-# Useful for correcting systematic real-world bias without code edits.
-ARM_TARGET_SCALE = np.array([
-    float(os.getenv("ARM_TARGET_SCALE_X", "0.90")),
-    float(os.getenv("ARM_TARGET_SCALE_Y", "1.00")),
-    float(os.getenv("ARM_TARGET_SCALE_Z", "1.00")),
+# This affine matrix allows directional calibration without changing IK.
+ARM_TARGET_AFFINE = np.array([
+    [
+        float(os.getenv("ARM_TARGET_M00", os.getenv("ARM_TARGET_SCALE_X", "1.00"))),
+        float(os.getenv("ARM_TARGET_M01", "0.00")),
+        float(os.getenv("ARM_TARGET_M02", "0.00")),
+    ],
+    [
+        float(os.getenv("ARM_TARGET_M10", "0.00")),
+        float(os.getenv("ARM_TARGET_M11", os.getenv("ARM_TARGET_SCALE_Y", "1.00"))),
+        float(os.getenv("ARM_TARGET_M12", "0.00")),
+    ],
+    [
+        float(os.getenv("ARM_TARGET_M20", "0.00")),
+        float(os.getenv("ARM_TARGET_M21", "0.00")),
+        float(os.getenv("ARM_TARGET_M22", os.getenv("ARM_TARGET_SCALE_Z", "1.00"))),
+    ],
 ], dtype=float)
-ARM_TARGET_BIAS_M = np.array([
-    float(os.getenv("ARM_TARGET_BIAS_X_M", "0.00")),
-    float(os.getenv("ARM_TARGET_BIAS_Y_M", "0.00")),
-    float(os.getenv("ARM_TARGET_BIAS_Z_M", "0.00")),
-], dtype=float)
+ARM_TARGET_BIAS_M = np.array([0.0, 0.0, 0.0], dtype=float)
 
 
 def _rotation_matrix_xyz(roll_deg, pitch_deg, yaw_deg):
@@ -132,7 +147,7 @@ def camera_to_arm_frame(xyz_cm_dict):
     # Base mapping: Camera Z ≈ arm X, camera X ≈ arm -Y, camera Y ≈ arm -Z
     arm_nominal = np.array([cam[2], -cam[0], -cam[1]], dtype=float)
     arm_rot = CAM_TO_ARM_FINE_ROT @ arm_nominal
-    arm_cal = arm_rot * ARM_TARGET_SCALE + ARM_TARGET_BIAS_M
+    arm_cal = ARM_TARGET_AFFINE @ arm_rot + ARM_TARGET_BIAS_M
     return arm_cal + CAMERA_OFFSET_M
 
 
@@ -144,7 +159,7 @@ def camera_distance_m(xyz_cm_dict):
     return float(np.linalg.norm([x_m, y_m, z_m]))
 
 
-def _project_to_reachable(target_m, arm, safety_margin_m=0.02):
+def _project_to_reachable(target_m, arm, safety_margin_m=0.02, min_z=None):
     """Project a target to the nearest reachable point if needed."""
     target = np.array(target_m, dtype=float)
     base = np.array(arm.base_pos, dtype=float)
@@ -159,14 +174,21 @@ def _project_to_reachable(target_m, arm, safety_margin_m=0.02):
         return target, False
 
     projected = base + (vec / dist) * max_r
+    if min_z is not None:
+        projected[2] = max(float(min_z), projected[2])
     return projected, True
 
 
 def _stem_cut_point_from_center(target_m, arm):
-    """Target stem by moving vertically above tomato center by 1-2 cm."""
+    """Target stem as center + vertical offset in arm-frame Z."""
     cut_pt = np.array(target_m, dtype=float).copy()
     cut_pt[2] += STEM_VERTICAL_OFFSET_M
-    cut_pt, was_projected = _project_to_reachable(cut_pt, arm)
+    # Never let reach projection drag the stem target below the center+offset.
+    cut_pt, was_projected = _project_to_reachable(
+        cut_pt,
+        arm,
+        min_z=float(target_m[2] + STEM_VERTICAL_OFFSET_M),
+    )
     return cut_pt, was_projected
 
 
@@ -178,21 +200,19 @@ def _solve_ik_with_fallback(arm, q_current, target_m, cut_pt):
     target_m = np.array(target_m, dtype=float)
     cut_pt = np.array(cut_pt, dtype=float)
 
-    # Build conservative fallback targets around the stem point.
-    retry_points = [
-        cut_pt,
-        target_m + np.array([0.0, 0.0, max(0.008, STEM_VERTICAL_OFFSET_M * 0.5)]),
-        target_m,
-        target_m + np.array([0.0, 0.0, -0.010]),
-    ]
-
-    # Also try slight pullback toward base to avoid kinematic boundary lock.
-    base = np.array(arm.base_pos, dtype=float)
-    vec = target_m - base
-    dist = float(np.linalg.norm(vec))
-    if dist > 1e-9:
-        backoff = target_m - (vec / dist) * 0.015
-        retry_points.append(backoff)
+    # Build fallback targets around the nominal stem point.
+    # Defaults use measurement-driven targeting with no lateral/depth bias.
+    stem_z = float(target_m[2] + STEM_VERTICAL_OFFSET_M)
+    dx = float(STEM_DEPTH_BRACKET_M)
+    dy = float(STEM_LATERAL_BRACKET_M)
+    retry_points = [cut_pt]
+    if dx > 0.0:
+        retry_points.append(cut_pt + np.array([dx, 0.0, 0.0], dtype=float))
+        retry_points.append(cut_pt + np.array([-dx, 0.0, 0.0], dtype=float))
+    if dy > 0.0:
+        retry_points.append(cut_pt + np.array([0.0, dy, 0.0], dtype=float))
+        retry_points.append(cut_pt + np.array([0.0, -dy, 0.0], dtype=float))
+    retry_points.append(target_m + np.array([0.0, 0.0, max(STEM_VERTICAL_OFFSET_M + 0.006, 0.021)]))
 
     best = {
         "accepted": False,
@@ -201,27 +221,39 @@ def _solve_ik_with_fallback(arm, q_current, target_m, cut_pt):
         "iters": IK_MAX_ITERS,
         "q": np.array(q_current, dtype=float).copy(),
         "target": cut_pt,
+        "score": 1e9,
     }
 
     for p in retry_points:
-        p, _ = _project_to_reachable(p, arm)
+        p, _ = _project_to_reachable(p, arm, min_z=stem_z)
         arm.set_joint_angles(q_current)
-        solved, err, iters = arm.inverse_kinematics(p, max_iters=IK_MAX_ITERS, tol=8e-4)
+        solved, err, iters = arm.inverse_kinematics(
+            p,
+            max_iters=IK_MAX_ITERS,
+            tol=8e-4,
+            obstacle_center=target_m,
+            obstacle_radius=TOMATO_RADIUS_M,
+            obstacle_clearance=IK_OBSTACLE_CLEARANCE_M,
+        )
         q_try = arm.joint_angles.copy()
 
-        if err < best["err"]:
+        # Prefer low error and small displacement from the nominal stem point.
+        displacement = float(np.linalg.norm(p - cut_pt))
+        score = float(err + 0.25 * displacement)
+        if score < best["score"]:
             best.update({
                 "solved": solved,
                 "err": float(err),
                 "iters": int(iters),
                 "q": q_try,
                 "target": p,
+                "score": score,
             })
 
-        if solved or err <= IK_ACCEPT_ERR_M:
-            return True, solved, float(err), int(iters), q_try, p
+    if best["solved"] or best["err"] <= IK_ACCEPT_ERR_M:
+        return True, best["solved"], best["err"], best["iters"], best["q"], best["target"]
 
-    return best["accepted"], best["solved"], best["err"], best["iters"], best["q"], best["target"]
+    return False, best["solved"], best["err"], best["iters"], best["q"], best["target"]
 
 
 # ── Trajectory interpolation ──────────────────────────────────────────────────
@@ -359,20 +391,14 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total):
     # Close gripper / scissors to cut the stem
     logger.info(f"[{index+1}/{total}] {'[SKIPPED-DRY-RUN/NO-CUT]' if DRY_RUN or NO_CUT else 'CUTTING'} stem...")
     if not (DRY_RUN or NO_CUT):
-        if _user_confirm(f"READY TO CUT STEM for tomato #{index+1}. Proceed?",
-                        default_yes=True):
-            driver.gripper_close(duration_ms=500)
-            time.sleep(GRIPPER_DELAY_S)
-            logger.info(f"[{index+1}/{total}] Cut complete!")
-            _ensure_gripper_open(driver, duration_ms=450)
-            time.sleep(0.3)
-        else:
-            logger.warning(f"[{index+1}/{total}] Cut cancelled by user — skipping")
-            _ensure_gripper_open(driver, duration_ms=450)
-            return False
+        driver.gripper_close(duration_ms=CUT_GRIPPER_CLOSE_MS)
+        time.sleep(GRIPPER_DELAY_S)
+        logger.info(f"[{index+1}/{total}] Cut complete!")
+        _ensure_gripper_open(driver, duration_ms=450)
+        time.sleep(0.3)
     else:
         if DRY_RUN:
-            _log_dry_run(f"[{index+1}/{total}] Closing gripper (500ms)")
+            _log_dry_run(f"[{index+1}/{total}] Closing gripper ({CUT_GRIPPER_CLOSE_MS}ms)")
             time.sleep(0.5)
             _log_dry_run(f"[{index+1}/{total}] Opening gripper (450ms)")
         else:
@@ -519,7 +545,51 @@ def _collect_ranked_targets(detector, cap, window_s):
     return ranked[:MAX_HARVEST_PER_CYCLE]
 
 
-def _harvest_sequence(arm, driver, tomatoes):
+def _refine_target_xyz(detector, cap, seed_xyz_cm, window_s=PREMOVE_REFINE_S):
+    """Refine a selected tomato xyz by short remeasurement near the seed target."""
+    samples = []
+    deadline = time.time() + max(0.1, float(window_s))
+    seed = np.array([
+        float(seed_xyz_cm["x"]),
+        float(seed_xyz_cm["y"]),
+        float(seed_xyz_cm["z"]),
+    ], dtype=float)
+
+    while time.time() < deadline:
+        _drain_camera_frames(cap, count=1)
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            continue
+
+        detections = detector.detect(frame, use_tracker=False)
+        if not detections:
+            continue
+
+        best = None
+        best_d = 1e9
+        for det in detections:
+            xyz = det.get("xyz_cm")
+            if not xyz:
+                continue
+            v = np.array([float(xyz["x"]), float(xyz["y"]), float(xyz["z"])], dtype=float)
+            d = float(np.linalg.norm(v - seed))
+            if d < best_d:
+                best_d = d
+                best = v
+
+        if best is not None and best_d <= PREMOVE_REFINE_MAX_DELTA_CM:
+            samples.append(best)
+
+    if len(samples) < PREMOVE_REFINE_MIN_HITS:
+        return seed_xyz_cm, 0
+
+    arr = np.array(samples, dtype=float)
+    med = np.median(arr, axis=0)
+    refined = {"x": float(med[0]), "y": float(med[1]), "z": float(med[2])}
+    return refined, int(len(samples))
+
+
+def _harvest_sequence(arm, driver, tomatoes, detector=None, cap=None):
     harvested = 0
     n = len(tomatoes)
     for i, tomato in enumerate(tomatoes):
@@ -531,7 +601,21 @@ def _harvest_sequence(arm, driver, tomatoes):
             continue
 
         logger.info(f"\n--- Harvesting tomato #{i+1}/{n} (distance: {dist:.1f}cm) ---")
-        success = harvest_single_tomato(arm, driver, tomato["xyz_cm"], i, n)
+        xyz_cm = dict(tomato["xyz_cm"])
+        if detector is not None and cap is not None:
+            refined_xyz, hits = _refine_target_xyz(detector, cap, xyz_cm)
+            if hits > 0:
+                xyz_cm = refined_xyz
+                d_ref = float(np.linalg.norm([xyz_cm["x"], xyz_cm["y"], xyz_cm["z"]]))
+                logger.info(
+                    f"[{i+1}/{n}] Refined target from {hits} frame(s): "
+                    f"xyz_cm=({xyz_cm['x']:.1f}, {xyz_cm['y']:.1f}, {xyz_cm['z']:.1f}), "
+                    f"distance={d_ref:.1f}cm"
+                )
+            else:
+                logger.info(f"[{i+1}/{n}] No stable refine sample; using scan target")
+
+        success = harvest_single_tomato(arm, driver, xyz_cm, i, n)
         if success:
             harvested += 1
             logger.info(f"Tomato #{i+1} harvested successfully!")
@@ -560,7 +644,7 @@ def run_harvesting(sim_mode=False):
     logger.info(
         f"3D mapping: CAMERA_OFFSET_M={CAMERA_OFFSET_M.tolist()}, "
         f"CAMERA_AXIS_SCALE={CAMERA_AXIS_SCALE.tolist()}, "
-        f"ARM_TARGET_SCALE={ARM_TARGET_SCALE.tolist()}, "
+        f"ARM_TARGET_AFFINE={ARM_TARGET_AFFINE.tolist()}, "
         f"ARM_TARGET_BIAS_M={ARM_TARGET_BIAS_M.tolist()}"
     )
 
@@ -642,7 +726,7 @@ def run_harvesting(sim_mode=False):
                     f"sightings={t['sightings']}"
                 )
 
-            harvested = _harvest_sequence(arm, driver, tomatoes)
+            harvested = _harvest_sequence(arm, driver, tomatoes, detector=detector, cap=cap)
 
             # ── Phase 3: RETURN to saved home base ────────────────────────
             logger.info(f"\n{harvested}/{n} tomatoes harvested. "
@@ -808,12 +892,12 @@ def main():
                     
                     if not (DRY_RUN or NO_CUT):
                         logger.info(f"[INFO] CUTTING stem of tomato #{i+1}...")
-                        driver.gripper_close(duration_ms=500)
+                        driver.gripper_close(duration_ms=CUT_GRIPPER_CLOSE_MS)
                         time.sleep(GRIPPER_DELAY_S)
                         _ensure_gripper_open(driver, duration_ms=450)
                     else:
                         if DRY_RUN:
-                            _log_dry_run(f"[INFO] Tomato #{i+1}: Closing gripper (500ms)")
+                            _log_dry_run(f"[INFO] Tomato #{i+1}: Closing gripper ({CUT_GRIPPER_CLOSE_MS}ms)")
                             time.sleep(0.5)
                             _log_dry_run(f"[INFO] Tomato #{i+1}: Opening gripper (450ms)")
                         elif NO_CUT:
