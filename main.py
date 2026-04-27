@@ -71,6 +71,12 @@ RETRACT_DELAY_S      = 1.0    # wait after returning home
 TOMATO_RADIUS_M      = 0.035  # average tomato radius in metres
 # Default target reference is the detected center point (0cm Z offset).
 STEM_VERTICAL_OFFSET_M = float(os.getenv("STEM_VERTICAL_OFFSET_M", "0.000"))
+# Depth pullback to compensate for end-effector / gripper-tip protrusion past the
+# wrist. The detected camera depth places the WRIST at the tomato; subtracting
+# this offset along arm-frame X (camera depth axis) lands the gripper tip
+# exactly at the stem instead of overshooting. Override with env var.
+ARM_TOTAL_LENGTH_M     = float(os.getenv("ARM_TOTAL_LENGTH_M", "0.36"))
+STEM_DEPTH_OFFSET_M    = float(os.getenv("STEM_DEPTH_OFFSET_M", "0.030"))
 CUT_GRIPPER_CLOSE_MS = int(os.getenv("CUT_GRIPPER_CLOSE_MS", "200"))
 CAMERA_INDEX         = 0      # default camera index
 TRAJ_STEPS_APPROACH  = 50     # more interpolation points for smoother approach
@@ -118,6 +124,19 @@ CENTER_RELOCK_S = float(os.getenv("CENTER_RELOCK_S", "0.6"))
 CENTER_RELOCK_THRESH_M = float(os.getenv("CENTER_RELOCK_THRESH_M", "0.010"))
 CENTER_RELOCK_MAX_ITERS = int(os.getenv("CENTER_RELOCK_MAX_ITERS", "2"))
 CENTER_RELOCK_MIN_HITS = int(os.getenv("CENTER_RELOCK_MIN_HITS", str(PREMOVE_REFINE_MIN_HITS)))
+# Closed-loop pixel-space visual-servo refinement (port of intelligent_grasp.py PID idea):
+# nudge arm-frame Y/Z until the tomato's pixel center sits inside the image-centre dead-zone
+# for VS_STABLE_FRAMES consecutive frames, then commit to the cut. Removes residual
+# focal-length / mounting bias that 1-shot 3D estimation cannot correct.
+VS_ENABLED = os.getenv("VS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+VS_PIXEL_TOL = float(os.getenv("VS_PIXEL_TOL", "8.0"))         # pixel dead-zone (per axis)
+VS_MAX_ITERS = int(os.getenv("VS_MAX_ITERS", "6"))
+VS_STABLE_FRAMES = int(os.getenv("VS_STABLE_FRAMES", "3"))
+VS_KP_LATERAL = float(os.getenv("VS_KP_LATERAL", "0.6"))      # gain on (px*depth/f)
+VS_KP_VERTICAL = float(os.getenv("VS_KP_VERTICAL", "0.6"))
+VS_MAX_STEP_M = float(os.getenv("VS_MAX_STEP_M", "0.020"))    # per-iter clamp (2cm)
+VS_STEP_DURATION_MS = int(os.getenv("VS_STEP_DURATION_MS", "900"))
+VS_FOCAL_PX_FALLBACK = float(os.getenv("VS_FOCAL_PX_FALLBACK", "700.0"))
 EXACT_CENTER_TARGET = os.getenv("EXACT_CENTER_TARGET", "0").strip().lower() not in {
     "0", "false", "no"
 }
@@ -316,9 +335,16 @@ def _project_to_reachable(target_m, arm, safety_margin_m=0.02, min_z=None):
 
 
 def _stem_cut_point_from_center(target_m, arm):
-    """Target point as center + configurable vertical offset in arm-frame Z."""
+    """Target point as center + configurable vertical offset in arm-frame Z,
+    minus a depth pullback in arm-frame X to compensate for gripper-tip
+    protrusion (Z_final_depth = Z_detected_depth - STEM_DEPTH_OFFSET_M).
+    """
     cut_pt = np.array(target_m, dtype=float).copy()
     cut_pt[2] += STEM_VERTICAL_OFFSET_M
+    # Pull the target back along the arm-frame X (depth) axis so the gripper
+    # tip lands on the stem rather than overshooting it.
+    if cut_pt[0] > STEM_DEPTH_OFFSET_M:
+        cut_pt[0] -= STEM_DEPTH_OFFSET_M
     # Never let reach projection drag the stem target below the center+offset.
     cut_pt, was_projected = _project_to_reachable(
         cut_pt,
@@ -545,7 +571,8 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total, detector=Non
 
     logger.info(f"[{index+1}/{total}] Arm-frame tomato center: "
                 f"[{center_target_m[0]:.3f}, {center_target_m[1]:.3f}, {center_target_m[2]:.3f}]m")
-    logger.info(f"[{index+1}/{total}] Stem cut target (+{STEM_VERTICAL_OFFSET_M*100.0:.1f}cm Z): "
+    logger.info(f"[{index+1}/{total}] Stem cut target "
+                f"(Z+{STEM_VERTICAL_OFFSET_M*100.0:.1f}cm, depth-{STEM_DEPTH_OFFSET_M*100.0:.1f}cm): "
                 f"[{cut_target_m[0]:.3f}, {cut_target_m[1]:.3f}, {cut_target_m[2]:.3f}]m")
 
     # Center stability gate (from provided intelligent grasp logic):
@@ -721,13 +748,18 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total, detector=Non
             tomato_xyz_cm = relock_xyz_cm
             time.sleep(0.2)
 
+    # Pixel-space visual-servo refinement (port of intelligent_grasp.py closed-loop PID idea).
+    if VS_ENABLED:
+        corr_target, q_cut = _visual_servo_refine(
+            arm, driver, detector, cap, corr_target, q_cut, index, total
+        )
+
     # Close gripper / scissors to cut the stem
     logger.info(f"[{index+1}/{total}] {'[SKIPPED-DRY-RUN/NO-CUT]' if DRY_RUN or NO_CUT else 'CUTTING'} stem...")
     if not (DRY_RUN or NO_CUT):
         _perform_fast_cut(driver, index=index, total=total)
         logger.info(f"[{index+1}/{total}] Cut complete!")
         time.sleep(0.3)
-        # post-cut actions removed
     else:
         if DRY_RUN:
             _log_dry_run(f"[{index+1}/{total}] Closing gripper ({CUT_GRIPPER_CLOSE_MS}ms)")
@@ -1604,7 +1636,6 @@ def main():
                     if not (DRY_RUN or NO_CUT):
                         logger.info(f"[INFO] CUTTING stem of tomato #{i+1}...")
                         _perform_fast_cut(driver, index=i, total=len(tomatoes))
-                        # post-cut actions removed
                     else:
                         if DRY_RUN:
                             _log_dry_run(f"[INFO] Tomato #{i+1}: Closing gripper ({CUT_GRIPPER_CLOSE_MS}ms)")
@@ -1624,7 +1655,7 @@ def main():
                     execute_trajectory(arm, driver, q_current, home_angles, 
                                      steps=TRAJ_STEPS_RETRACT, duration_ms=RETRACT_DURATION_MS)
                     arm.set_joint_angles(home_angles)
-                    driver.move_servos(home_pulses, duration_ms=6000)
+                    driver.move_servos(home_pulses, duration_ms=3000)
                 else:
                     _log_dry_run("Returning arm to home position")
                 time.sleep(RETRACT_DELAY_S)
