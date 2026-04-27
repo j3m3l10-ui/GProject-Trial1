@@ -33,7 +33,7 @@ from ultralytics import YOLO
 
 logger = logging.getLogger(__name__)
 
-ARM_REACH_CM = 36.0
+ARM_REACH_CM = 41.0
 
 # ── Model path resolution ──────────────────────────────────────────────────────
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -423,11 +423,27 @@ class TomatoDetector:
     """
 
     def __init__(self, model_path=None, confidence=0.35,
-                 focal_length_px=700, real_diameter_cm=7.0,
-                 imgsz=320):
+                 focal_length_px=None, real_diameter_cm=7.0,
+                 infer_imgsz=320, imgsz=None):
+        """Initialize detector.
+
+        For accurate XYZ/depth, calibrate focal length to your camera.
+        If omitted, default 700px is used and a warning is emitted.
+        """
         self.model_path = model_path or _resolve_model_path()
         self.model = YOLO(self.model_path)
         self.confidence = confidence
+        if focal_length_px is None:
+            import warnings
+            warnings.warn(
+                "focal_length_px not provided — using default 700 px which "
+                "will give INACCURATE depth unless your camera focal length matches. "
+                "Calibrate with det.calibrate_focal_length(pixel_diameter=<px>, "
+                "known_distance_cm=<cm>) and pass focal_length_px=<value>.",
+                UserWarning,
+                stacklevel=2,
+            )
+            focal_length_px = 700.0
         self.focal_length_px = focal_length_px
         self.focal_length_x_px = float(os.getenv("TOMATO_FX_PX", focal_length_px))
         self.focal_length_y_px = float(os.getenv("TOMATO_FY_PX", focal_length_px))
@@ -435,8 +451,9 @@ class TomatoDetector:
         self.cy_offset_px = float(os.getenv("TOMATO_CY_OFFSET_PX", "0.0"))
         self.depth_scale = float(os.getenv("TOMATO_DEPTH_SCALE", "1.00"))
         self.depth_bias_cm = float(os.getenv("TOMATO_DEPTH_BIAS_CM", "0.0"))
+        self.depth_diameter_blend = float(os.getenv("TOMATO_DEPTH_DIAM_BLEND", "0.65"))
         self.real_diameter_cm = real_diameter_cm
-        self.imgsz = imgsz
+        self.imgsz = int(imgsz if imgsz is not None else infer_imgsz)
 
         # Filter parameters (relaxed for real-world RPi camera conditions)
         self.min_bbox_area = 800
@@ -549,6 +566,18 @@ class TomatoDetector:
         if area <= 1.0 or perim <= 1.0:
             return None
 
+        moments = cv2.moments(cnt)
+        if abs(moments["m00"]) > 1e-6:
+            cx = float(moments["m10"] / moments["m00"])
+            cy = float(moments["m01"] / moments["m00"])
+        else:
+            x, y, w, h = cv2.boundingRect(cnt)
+            cx = float(x + 0.5 * w)
+            cy = float(y + 0.5 * h)
+
+        (_, _), encl_radius = cv2.minEnclosingCircle(cnt)
+        enclosing_diameter_px = float(max(1e-6, 2.0 * encl_radius))
+
         circularity = float(min(1.0, 4.0 * math.pi * area / (perim * perim)))
         eq_diameter_px = float(np.sqrt(4.0 * area / math.pi))
 
@@ -564,9 +593,26 @@ class TomatoDetector:
             "area": area,
             "circularity": circularity,
             "eq_diameter_px": eq_diameter_px,
+            "enclosing_diameter_px": enclosing_diameter_px,
+            "centroid_px": (cx, cy),
             "hue_std": hue_std,
             "sat_std": sat_std,
         }
+
+    def _depth_diameter_px(self, metrics, bbox_w, bbox_h):
+        """Robust diameter estimate for depth from contour + bbox geometry."""
+        eq_d = float(metrics.get("eq_diameter_px", 0.0))
+        enc_d = float(metrics.get("enclosing_diameter_px", 0.0))
+        box_d = float(max(1.0, min(bbox_w, bbox_h)))
+
+        if eq_d <= 0.0:
+            return box_d
+        if enc_d <= 0.0:
+            return min(eq_d, box_d)
+
+        alpha = float(np.clip(self.depth_diameter_blend, 0.0, 1.0))
+        contour_blend = alpha * eq_d + (1.0 - alpha) * enc_d
+        return float(min(max(1.0, contour_blend), box_d))
 
     def _passes_blob_gates(self, metrics):
         if metrics is None:
@@ -850,11 +896,18 @@ class TomatoDetector:
             if not self._passes_blob_gates(metrics):
                 continue
 
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             w = max(1, x2 - x1)
             h = max(1, y2 - y1)
-            # Equivalent-area diameter is more stable than raw bbox width.
-            effective_diam_px = min(metrics["eq_diameter_px"], float(min(w, h)))
+            cxy = metrics.get("centroid_px")
+            if cxy is None:
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            else:
+                cx = int(round(x1 + float(cxy[0])))
+                cy = int(round(y1 + float(cxy[1])))
+                cx = int(np.clip(cx, x1, x2 - 1 if x2 > x1 else x1))
+                cy = int(np.clip(cy, y1, y2 - 1 if y2 > y1 else y1))
+
+            effective_diam_px = self._depth_diameter_px(metrics, w, h)
             z_cm = self.estimate_depth_cm(effective_diam_px)
             if z_cm is None:
                 continue
@@ -928,10 +981,18 @@ class TomatoDetector:
                             f"(stage {stage_idx}, red={red_ratio:.2f})")
                 continue
 
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             w = max(1, x2 - x1)
             h = max(1, y2 - y1)
-            effective_diam_px = min(metrics["eq_diameter_px"], float(min(w, h)))
+            cxy = metrics.get("centroid_px")
+            if cxy is None:
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            else:
+                cx = int(round(x1 + float(cxy[0])))
+                cy = int(round(y1 + float(cxy[1])))
+                cx = int(np.clip(cx, x1, x2 - 1 if x2 > x1 else x1))
+                cy = int(np.clip(cy, y1, y2 - 1 if y2 > y1 else y1))
+
+            effective_diam_px = self._depth_diameter_px(metrics, w, h)
             z_cm = self.estimate_depth_cm(effective_diam_px)
             if z_cm is None:
                 continue

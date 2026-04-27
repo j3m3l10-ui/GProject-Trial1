@@ -28,10 +28,13 @@ Hand-in-Eye: camera is mounted between wrist (ID3) and gripper (ID1).
 """
 
 import argparse
+import json
 import logging
+import sqlite3
 import sys
 import time
 import os
+import threading
 import cv2
 import numpy as np
 
@@ -51,8 +54,9 @@ logger = logging.getLogger(__name__)
 DRY_RUN = False        # If True, log all moves but don't send servo commands
 NO_CUT = False         # If True, skip the actual gripper close (cutting) action
 NO_CONFIRM = False     # If True, skip confirmation prompts
-SINGLE_PASS = False    # If True, run only one cycle then exit
+SINGLE_PASS = True     # If True, run only one cycle then exit
 TEST_CYCLES = None     # If set, limit total cycles to this number
+SINGLE_CUT_THEN_HOME = False  # If True, stop after first successful cut
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 SCAN_DURATION_S      = 3.0    # seconds to scan for tomatoes
@@ -60,32 +64,70 @@ SCAN_ANALYSIS_S      = 1.2    # seconds for heavy authenticity scan pass
 CONFIRM_DELAY_S      = 3.0    # seconds camera must confirm before arm moves
 MAX_HARVEST_PER_CYCLE = 3     # max tomatoes per harvest cycle
 MIN_SIGHTINGS        = 2      # min frames a tomato must appear in to be confirmed
-MOVE_DURATION_MS     = 2200   # slower trajectory timing for safer arm motion
+MOVE_DURATION_MS     = 8000   # slower trajectory timing for safer arm motion
+RETRACT_DURATION_MS  = 12000  # slow return to protect components
 GRIPPER_DELAY_S      = 0.6    # wait after gripper close (cutting)
 RETRACT_DELAY_S      = 1.0    # wait after returning home
 TOMATO_RADIUS_M      = 0.035  # average tomato radius in metres
-STEM_VERTICAL_OFFSET_M = float(os.getenv("STEM_VERTICAL_OFFSET_M", "0.015"))
-CUT_GRIPPER_CLOSE_MS = int(os.getenv("CUT_GRIPPER_CLOSE_MS", "220"))
+# Default target reference is the detected center point (0cm Z offset).
+STEM_VERTICAL_OFFSET_M = float(os.getenv("STEM_VERTICAL_OFFSET_M", "0.000"))
+CUT_GRIPPER_CLOSE_MS = int(os.getenv("CUT_GRIPPER_CLOSE_MS", "200"))
 CAMERA_INDEX         = 0      # default camera index
-TRAJ_STEPS_APPROACH  = 28     # more interpolation points for smoother approach
-TRAJ_STEPS_RETRACT   = 34     # more interpolation points for smoother retract
+TRAJ_STEPS_APPROACH  = 50     # more interpolation points for smoother approach
+TRAJ_STEPS_RETRACT   = 60     # more interpolation points for smoother retract
+ACTION_GROUP_ENABLED = os.getenv("ACTION_GROUP_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no"
+}
+ACTION_GROUP_TIME_SCALE = float(os.getenv("ACTION_GROUP_TIME_SCALE", "1.35"))
+ACTION_GROUP_MIN_STEP_MS = int(os.getenv("ACTION_GROUP_MIN_STEP_MS", "180"))
+POST_CUT_ACTION_FILES = [
+    p.strip()
+    for p in os.getenv(
+        "POST_CUT_ACTION_FILES",
+        ""
+    ).split(",")
+    if p.strip()
+]
 LIVE_DETECT_EVERY_N  = 3      # run live overlay inference every N frames
 FRAME_DRAIN_COUNT    = 2      # flush stale buffered frames each iteration
 MIN_CLUSTER_FRAMES   = 2      # drop one-frame fluke targets
-ARM_MAX_REACH_FROM_CAMERA_M = 0.36  # hard physical limit from camera lens
+ARM_MAX_REACH_FROM_CAMERA_M = 0.41  # hard physical limit from camera lens
 IK_ACCEPT_ERR_M     = 0.020   # accept near-solution if IK cannot fully converge
 IK_MAX_ITERS        = 500
 IK_OBSTACLE_CLEARANCE_M = float(os.getenv("IK_OBSTACLE_CLEARANCE_M", "0.015"))
+JAC_CORR_THRESH_M = float(os.getenv("JAC_CORR_THRESH_M", "0.020"))
+JAC_CORR_MAX_ITERS = int(os.getenv("JAC_CORR_MAX_ITERS", "6"))
+JAC_CORR_GAIN = float(os.getenv("JAC_CORR_GAIN", "0.9"))
+JAC_CORR_MAX_STEP_RAD = float(os.getenv("JAC_CORR_MAX_STEP_RAD", "0.05"))
+JAC_CORR_STEP_MS = int(os.getenv("JAC_CORR_STEP_MS", "800"))
+JAC_CENTER_THRESH_M = float(os.getenv("JAC_CENTER_THRESH_M", "0.0015"))
+JAC_CENTER_MAX_ITERS = int(os.getenv("JAC_CENTER_MAX_ITERS", "80"))
+JAC_CENTER_BASE_LAM = float(os.getenv("JAC_CENTER_BASE_LAM", "0.01"))
 STEM_DEPTH_BRACKET_M = float(os.getenv("STEM_DEPTH_BRACKET_M", "0.000"))
 STEM_LATERAL_BRACKET_M = float(os.getenv("STEM_LATERAL_BRACKET_M", "0.000"))
 PREMOVE_REFINE_S = float(os.getenv("PREMOVE_REFINE_S", "0.9"))
 PREMOVE_REFINE_MAX_DELTA_CM = float(os.getenv("PREMOVE_REFINE_MAX_DELTA_CM", "12.0"))
 PREMOVE_REFINE_MIN_HITS = int(os.getenv("PREMOVE_REFINE_MIN_HITS", "2"))
+CENTER_STABLE_PIXEL_THRESH = float(os.getenv("CENTER_STABLE_PIXEL_THRESH", "3.0"))
+CENTER_STABLE_FRAMES = int(os.getenv("CENTER_STABLE_FRAMES", "10"))
+CENTER_STABLE_WINDOW_S = float(os.getenv("CENTER_STABLE_WINDOW_S", "2.5"))
+CENTER_RELOCK_ENABLED = os.getenv("CENTER_RELOCK_ENABLED", "0").strip().lower() not in {
+    "0", "false", "no"
+}
+CENTER_RELOCK_S = float(os.getenv("CENTER_RELOCK_S", "0.6"))
+CENTER_RELOCK_THRESH_M = float(os.getenv("CENTER_RELOCK_THRESH_M", "0.010"))
+CENTER_RELOCK_MAX_ITERS = int(os.getenv("CENTER_RELOCK_MAX_ITERS", "2"))
+CENTER_RELOCK_MIN_HITS = int(os.getenv("CENTER_RELOCK_MIN_HITS", str(PREMOVE_REFINE_MIN_HITS)))
+EXACT_CENTER_TARGET = os.getenv("EXACT_CENTER_TARGET", "0").strip().lower() not in {
+    "0", "false", "no"
+}
+FOCAL_LENGTH_PX_ENV = os.getenv("FOCAL_LENGTH_PX", "").strip()
+FOCAL_LENGTH_PX = float(FOCAL_LENGTH_PX_ENV) if FOCAL_LENGTH_PX_ENV else None
 
 # ── Camera-to-arm transform ───────────────────────────────────────────────────
 # Hand-in-Eye: at Search Home the camera has a known pose relative to
 # the arm base.  CALIBRATE THESE VALUES on the real robot.
-# Arm reach is 36.3cm — camera is between wrist (ID3) and gripper (ID1),
+# Arm reach is 41cm — camera is between wrist (ID3) and gripper (ID1),
 # roughly a few cm forward from base and above when at Search Home.
 # Defaults are intentionally conservative; tune via env vars below.
 CAMERA_OFFSET_M = np.array([
@@ -98,6 +140,9 @@ CAMERA_AXIS_SCALE = np.array([
     float(os.getenv("CAMERA_SCALE_Y", "1.0")),
     float(os.getenv("CAMERA_SCALE_Z", "1.0")),
 ], dtype=float)
+CAMERA_LATERAL_SIGN = float(os.getenv("CAMERA_LATERAL_SIGN", "-1.0"))
+CAMERA_LATERAL_GAIN = float(os.getenv("CAMERA_LATERAL_GAIN", "1.0"))
+CAMERA_VERTICAL_SIGN = float(os.getenv("CAMERA_VERTICAL_SIGN", "-1.0"))
 
 # Final target calibration in arm frame (post axis-map, pre-offset).
 # This affine matrix allows directional calibration without changing IK.
@@ -118,7 +163,40 @@ ARM_TARGET_AFFINE = np.array([
         float(os.getenv("ARM_TARGET_M22", os.getenv("ARM_TARGET_SCALE_Z", "1.00"))),
     ],
 ], dtype=float)
-ARM_TARGET_BIAS_M = np.array([0.0, 0.0, 0.0], dtype=float)
+HAND_EYE_FILE = os.getenv(
+    "HAND_EYE_FILE",
+    os.path.join(os.path.dirname(__file__), "hand_eye_transform.json"),
+)
+HAND_EYE_REFERENCE_FRAME = os.getenv("HAND_EYE_REFERENCE_FRAME", "wrist").strip().lower()
+ARM_BIAS_FILE = os.getenv(
+    "ARM_BIAS_FILE",
+    os.path.join(os.path.dirname(__file__), "arm_bias_calibration.json"),
+)
+
+
+def _load_arm_target_bias():
+    bias = np.zeros(3, dtype=float)
+    if os.path.isfile(ARM_BIAS_FILE):
+        try:
+            with open(ARM_BIAS_FILE, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            loaded = np.array(payload.get("bias_m", [0.0, 0.0, 0.0]), dtype=float)
+            if loaded.shape == (3,):
+                bias += loaded
+        except Exception as exc:
+            logger.warning(
+                f"Failed to load arm bias calibration from {ARM_BIAS_FILE}: {exc}. "
+                "Ignoring saved bias file."
+            )
+    bias += np.array([
+        float(os.getenv("ARM_TARGET_BIAS_X_M", "0.0")),
+        float(os.getenv("ARM_TARGET_BIAS_Y_M", "0.0")),
+        float(os.getenv("ARM_TARGET_BIAS_Z_M", "0.0")),
+    ], dtype=float)
+    return bias
+
+
+ARM_TARGET_BIAS_M = _load_arm_target_bias()
 
 
 def _rotation_matrix_xyz(roll_deg, pitch_deg, yaw_deg):
@@ -139,13 +217,71 @@ CAM_TO_ARM_FINE_ROT = _rotation_matrix_xyz(
 )
 
 
+def _transform_from_rotation_translation(rotation_m, translation_v):
+    transform = np.eye(4, dtype=float)
+    transform[:3, :3] = np.array(rotation_m, dtype=float)
+    transform[:3, 3] = np.array(translation_v, dtype=float)
+    return transform
+
+
+def _load_hand_eye_camera_to_arm_transform():
+    if not os.path.isfile(HAND_EYE_FILE):
+        return None
+
+    try:
+        with open(HAND_EYE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        cam_to_gripper = np.array(payload.get("T"), dtype=float)
+        if cam_to_gripper.shape != (4, 4):
+            raise ValueError("expected 4x4 transform under key 'T'")
+
+        # Common bug: hand-eye translations saved in mm while code expects metres.
+        t_norm = float(np.linalg.norm(cam_to_gripper[:3, 3]))
+        if t_norm > 2.0:
+            cam_to_gripper = cam_to_gripper.copy()
+            cam_to_gripper[:3, 3] /= 1000.0
+            logger.warning(
+                "Hand-eye translation appears to be in millimetres; auto-converting to metres"
+            )
+
+        arm = FiveDOFArm()
+        arm.set_joint_angles(get_home_angles())
+        positions, rotations = arm.forward_kinematics(arm.joint_angles)
+        # Camera is mounted between wrist and gripper. Using the final tool-tip
+        # frame introduces a near-constant directional offset (~link_lengths[4]).
+        # Default to wrist/gripper-base frame for hand-eye composition.
+        ref_idx = -2 if HAND_EYE_REFERENCE_FRAME != "tool" else -1
+        base_to_gripper = _transform_from_rotation_translation(
+            rotations[ref_idx],
+            positions[ref_idx],
+        )
+        return base_to_gripper @ cam_to_gripper
+    except Exception as exc:
+        logger.warning(
+            f"Failed to load hand-eye transform from {HAND_EYE_FILE}: {exc}. "
+            "Falling back to coarse camera mapping."
+        )
+        return None
+
+
+HAND_EYE_CAMERA_TO_ARM_T = _load_hand_eye_camera_to_arm_transform()
+
+
 def camera_to_arm_frame(xyz_cm_dict):
     """Convert vision xyz_cm (camera frame) → arm base frame (metres)."""
     cam = np.array([xyz_cm_dict["x"], xyz_cm_dict["y"], xyz_cm_dict["z"]],
                    dtype=float) / 100.0
     cam = cam * CAMERA_AXIS_SCALE
-    # Base mapping: Camera Z ≈ arm X, camera X ≈ arm -Y, camera Y ≈ arm -Z
-    arm_nominal = np.array([cam[2], -cam[0], -cam[1]], dtype=float)
+    if HAND_EYE_CAMERA_TO_ARM_T is not None:
+        arm_cal = (HAND_EYE_CAMERA_TO_ARM_T @ np.append(cam, 1.0))[:3]
+        return ARM_TARGET_AFFINE @ arm_cal + ARM_TARGET_BIAS_M
+
+    # Base mapping with explicit signs/gain for lateral calibration.
+    arm_nominal = np.array([
+        cam[2],
+        CAMERA_LATERAL_SIGN * CAMERA_LATERAL_GAIN * cam[0],
+        CAMERA_VERTICAL_SIGN * cam[1],
+    ], dtype=float)
     arm_rot = CAM_TO_ARM_FINE_ROT @ arm_nominal
     arm_cal = ARM_TARGET_AFFINE @ arm_rot + ARM_TARGET_BIAS_M
     return arm_cal + CAMERA_OFFSET_M
@@ -180,7 +316,7 @@ def _project_to_reachable(target_m, arm, safety_margin_m=0.02, min_z=None):
 
 
 def _stem_cut_point_from_center(target_m, arm):
-    """Target stem as center + vertical offset in arm-frame Z."""
+    """Target point as center + configurable vertical offset in arm-frame Z."""
     cut_pt = np.array(target_m, dtype=float).copy()
     cut_pt[2] += STEM_VERTICAL_OFFSET_M
     # Never let reach projection drag the stem target below the center+offset.
@@ -192,68 +328,75 @@ def _stem_cut_point_from_center(target_m, arm):
     return cut_pt, was_projected
 
 
-def _solve_ik_with_fallback(arm, q_current, target_m, cut_pt):
-    """Try IK on stem target with safe retries around the target.
+def _solve_ik_with_fallback(arm, q_current, target_m):
+    """Solve to the exact tomato center using Jacobian DLS from current pose.
 
     Returns (accepted, solved_flag, err, iters, q_solution, used_target).
     """
     target_m = np.array(target_m, dtype=float)
-    cut_pt = np.array(cut_pt, dtype=float)
+    q_current = np.array(q_current, dtype=float).copy()
 
-    # Build fallback targets around the nominal stem point.
-    # Defaults use measurement-driven targeting with no lateral/depth bias.
-    stem_z = float(target_m[2] + STEM_VERTICAL_OFFSET_M)
-    dx = float(STEM_DEPTH_BRACKET_M)
-    dy = float(STEM_LATERAL_BRACKET_M)
-    retry_points = [cut_pt]
-    if dx > 0.0:
-        retry_points.append(cut_pt + np.array([dx, 0.0, 0.0], dtype=float))
-        retry_points.append(cut_pt + np.array([-dx, 0.0, 0.0], dtype=float))
-    if dy > 0.0:
-        retry_points.append(cut_pt + np.array([0.0, dy, 0.0], dtype=float))
-        retry_points.append(cut_pt + np.array([0.0, -dy, 0.0], dtype=float))
-    retry_points.append(target_m + np.array([0.0, 0.0, max(STEM_VERTICAL_OFFSET_M + 0.006, 0.021)]))
+    # Seed Jacobian with the best available multi-seed IK solution.
+    arm.set_joint_angles(q_current)
+    ik_solved, ik_err, _ = arm.inverse_kinematics(
+        target_m,
+        max_iters=IK_MAX_ITERS,
+        tol=8e-4,
+        obstacle_center=None,
+        obstacle_radius=0.0,
+    )
+    q = arm.joint_angles.copy() if (ik_solved or ik_err <= IK_ACCEPT_ERR_M) else q_current
 
-    best = {
-        "accepted": False,
-        "solved": False,
-        "err": 1e9,
-        "iters": IK_MAX_ITERS,
-        "q": np.array(q_current, dtype=float).copy(),
-        "target": cut_pt,
-        "score": 1e9,
-    }
+    best_q = q.copy()
+    best_err = float("inf")
+    solved = False
 
-    for p in retry_points:
-        p, _ = _project_to_reachable(p, arm, min_z=stem_z)
-        arm.set_joint_angles(q_current)
-        solved, err, iters = arm.inverse_kinematics(
-            p,
-            max_iters=IK_MAX_ITERS,
-            tol=8e-4,
-            obstacle_center=target_m,
-            obstacle_radius=TOMATO_RADIUS_M,
-            obstacle_clearance=IK_OBSTACLE_CLEARANCE_M,
-        )
-        q_try = arm.joint_angles.copy()
+    for it in range(1, max(1, JAC_CENTER_MAX_ITERS) + 1):
+        p = arm.end_effector_pos(q)
+        err_vec = target_m - p
+        err = float(np.linalg.norm(err_vec))
 
-        # Prefer low error and small displacement from the nominal stem point.
-        displacement = float(np.linalg.norm(p - cut_pt))
-        score = float(err + 0.25 * displacement)
-        if score < best["score"]:
-            best.update({
-                "solved": solved,
-                "err": float(err),
-                "iters": int(iters),
-                "q": q_try,
-                "target": p,
-                "score": score,
-            })
+        if err < best_err:
+            best_err = err
+            best_q = q.copy()
 
-    if best["solved"] or best["err"] <= IK_ACCEPT_ERR_M:
-        return True, best["solved"], best["err"], best["iters"], best["q"], best["target"]
+        if err <= JAC_CENTER_THRESH_M:
+            solved = True
+            best_q = q.copy()
+            best_err = err
+            break
 
-    return False, best["solved"], best["err"], best["iters"], best["q"], best["target"]
+        J = arm.jacobian(q)
+        cond = float(np.linalg.cond(J))
+        lam_scale = 1.0 if cond <= 25.0 else min(8.0, cond / 25.0)
+        lam = max(1e-4, JAC_CENTER_BASE_LAM * lam_scale)
+        A = J @ J.T + (lam ** 2) * np.eye(3)
+        dq = J.T @ np.linalg.solve(A, err_vec)
+
+        step_norm = float(np.linalg.norm(dq))
+        max_step = float(max(1e-6, JAC_CORR_MAX_STEP_RAD))
+        if step_norm > max_step:
+            dq *= max_step / step_norm
+
+        accepted = False
+        for scale in (1.0, 0.5, 0.25, 0.1):
+            q_try = q + dq * scale
+            for j in range(len(q_try)):
+                q_try[j] = np.clip(q_try[j], arm.joint_limits[j, 0], arm.joint_limits[j, 1])
+            e_try = float(np.linalg.norm(target_m - arm.end_effector_pos(q_try)))
+            if e_try < err:
+                q = q_try
+                accepted = True
+                break
+
+        if not accepted:
+            # No descent direction found from this local linearization.
+            break
+
+    arm.set_joint_angles(best_q)
+    accept_tol = min(float(IK_ACCEPT_ERR_M), 0.004) if EXACT_CENTER_TARGET else float(IK_ACCEPT_ERR_M)
+    accepted = solved or best_err <= accept_tol
+    return accepted, solved, best_err, it if 'it' in locals() else 0, best_q, target_m
 
 
 # ── Trajectory interpolation ──────────────────────────────────────────────────
@@ -277,10 +420,10 @@ def execute_trajectory(arm, driver, q_start, q_end, steps, duration_ms):
     backend = getattr(driver, "_backend", "")
     if backend.startswith("i2c"):
         steps = max(4, min(int(steps), 10))
-        min_step_ms = 180
+        min_step_ms = 220
     else:
         steps = max(4, int(steps))
-        min_step_ms = 80
+        min_step_ms = 140
 
     traj = interpolate_trajectory(q_start, q_end, steps)
     step_duration = max(min_step_ms, duration_ms // steps)
@@ -312,8 +455,51 @@ def execute_trajectory(arm, driver, q_start, q_end, steps, duration_ms):
     time.sleep(max(0.2, step_sleep))
 
 
+def _iterative_jacobian_correction(arm, driver, target_m, q_start, index, total):
+    """Iterative FK/Jacobian correction loop after the initial IK move."""
+    target = np.array(target_m, dtype=float)
+    q_curr = np.array(q_start, dtype=float).copy()
+    arm.set_joint_angles(q_curr)
+
+    last_err = float("inf")
+    for it in range(1, max(1, JAC_CORR_MAX_ITERS) + 1):
+        p_curr = arm.end_effector_pos(q_curr)
+        delta_p = target - p_curr
+        err = float(np.linalg.norm(delta_p))
+        last_err = err
+        logger.info(f"[{index+1}/{total}] Jacobian loop iter={it}: err={err*1000.0:.2f}mm")
+
+        if err <= JAC_CORR_THRESH_M:
+            return True, q_curr, err, it
+
+        J = arm.jacobian(q_curr)
+        J_pinv = np.linalg.pinv(J, rcond=1e-4)
+        delta_q = np.asarray(J_pinv @ delta_p, dtype=float)
+        delta_q *= float(max(0.0, JAC_CORR_GAIN))
+
+        step_norm = float(np.linalg.norm(delta_q))
+        max_step = float(max(1e-6, JAC_CORR_MAX_STEP_RAD))
+        if step_norm > max_step:
+            delta_q *= max_step / step_norm
+
+        q_next = q_curr + delta_q
+        arm.set_joint_angles(q_next)
+        q_next = arm.joint_angles.copy()
+        execute_trajectory(
+            arm,
+            driver,
+            q_curr,
+            q_next,
+            steps=6,
+            duration_ms=max(250, JAC_CORR_STEP_MS),
+        )
+        q_curr = q_next
+
+    return False, q_curr, last_err, JAC_CORR_MAX_ITERS
+
+
 # ── Single tomato harvest action ──────────────────────────────────────────────
-def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total):
+def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total, detector=None, cap=None):
     """
     Move arm from its current pose to the tomato's stem, cut, and leave
     the arm at the cut pose (caller decides whether to retract or continue).
@@ -324,32 +510,78 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total):
     if dist_cam_m > ARM_MAX_REACH_FROM_CAMERA_M:
         logger.warning(
             f"[{index+1}/{total}] Target at {dist_cam_m*100.0:.1f}cm from lens "
-            f"is beyond 36cm reach. Cannot harvest. Move closer."
+            f"is beyond 41cm reach. Cannot harvest. Move closer."
         )
         return False
 
     target_m = camera_to_arm_frame(tomato_xyz_cm)
-    logger.info(f"[{index+1}/{total}] Arm-frame target: "
-                f"[{target_m[0]:.3f}, {target_m[1]:.3f}, {target_m[2]:.3f}]m")
-
-    # If calibration drift pushes target just beyond reach, project to a safe
-    # reachable point so the arm still executes a meaningful motion.
-    target_m, was_projected = _project_to_reachable(target_m, arm)
-    if was_projected:
+    ik_input_m = np.array(target_m, dtype=float).copy()
+    if EXACT_CENTER_TARGET and (not arm.is_reachable(ik_input_m)):
         logger.warning(
-            f"[{index+1}/{total}] Target outside arm reach; projecting to "
-            f"[{target_m[0]:.3f}, {target_m[1]:.3f}, {target_m[2]:.3f}]m"
+            f"[{index+1}/{total}] Exact center target is outside reachable workspace: "
+            f"[{ik_input_m[0]:.3f}, {ik_input_m[1]:.3f}, {ik_input_m[2]:.3f}]m. Skipping."
         )
+        return False
+    if not EXACT_CENTER_TARGET:
+        ik_input_m, _ = _project_to_reachable(ik_input_m, arm)
 
-    # Compute stem cut point as center + vertical offset (1-2 cm up).
-    cut_pt, cut_projected = _stem_cut_point_from_center(target_m, arm)
-    if cut_projected:
+    # Requested transform-chain debug: raw camera xyz, arm-frame transform output,
+    # and final IK input after any gating/projection.
+    logger.info(
+        f"[{index+1}/{total}] Transform debug: "
+        f"cam_xyz_cm=({float(tomato_xyz_cm['x']):.2f}, {float(tomato_xyz_cm['y']):.2f}, {float(tomato_xyz_cm['z']):.2f}) "
+        f"-> arm_xyz_m=({target_m[0]:.4f}, {target_m[1]:.4f}, {target_m[2]:.4f}) "
+        f"-> ik_input_m=({ik_input_m[0]:.4f}, {ik_input_m[1]:.4f}, {ik_input_m[2]:.4f})"
+    )
+
+    center_target_m = np.array(ik_input_m, dtype=float)
+    cut_target_m, cut_projected = _stem_cut_point_from_center(center_target_m, arm)
+    if EXACT_CENTER_TARGET and cut_projected:
         logger.warning(
-            f"[{index+1}/{total}] Cut point adjusted to reachable point: "
-            f"[{cut_pt[0]:.3f}, {cut_pt[1]:.3f}, {cut_pt[2]:.3f}]m"
+            f"[{index+1}/{total}] Stem cut point projects outside reachable workspace in exact mode; "
+            "skipping to avoid wrong cut position"
         )
-    logger.info(f"[{index+1}/{total}] Stem cut point: "
-                f"[{cut_pt[0]:.3f}, {cut_pt[1]:.3f}, {cut_pt[2]:.3f}]m")
+        return False
+
+    logger.info(f"[{index+1}/{total}] Arm-frame tomato center: "
+                f"[{center_target_m[0]:.3f}, {center_target_m[1]:.3f}, {center_target_m[2]:.3f}]m")
+    logger.info(f"[{index+1}/{total}] Stem cut target (+{STEM_VERTICAL_OFFSET_M*100.0:.1f}cm Z): "
+                f"[{cut_target_m[0]:.3f}, {cut_target_m[1]:.3f}, {cut_target_m[2]:.3f}]m")
+
+    # Center stability gate (from provided intelligent grasp logic):
+    # require several consecutive stable center samples before moving.
+    if detector is not None and cap is not None:
+        stable_xyz, stable_ok, stable_hits = _wait_center_stable(
+            detector,
+            cap,
+            tomato_xyz_cm,
+            window_s=CENTER_STABLE_WINDOW_S,
+        )
+        if stable_ok:
+            tomato_xyz_cm = stable_xyz
+            target_m = camera_to_arm_frame(tomato_xyz_cm)
+            ik_input_m = np.array(target_m, dtype=float).copy()
+            if not EXACT_CENTER_TARGET:
+                ik_input_m, _ = _project_to_reachable(ik_input_m, arm)
+
+            center_target_m = np.array(ik_input_m, dtype=float)
+            cut_target_m, cut_projected = _stem_cut_point_from_center(center_target_m, arm)
+            if EXACT_CENTER_TARGET and cut_projected:
+                logger.warning(
+                    f"[{index+1}/{total}] Stable-center target projects outside reachable workspace in exact mode; "
+                    "skipping to avoid wrong cut position"
+                )
+                return False
+
+            logger.info(
+                f"[{index+1}/{total}] Stable center lock ({stable_hits} frames): "
+                f"xyz_cm=({tomato_xyz_cm['x']:.1f}, {tomato_xyz_cm['y']:.1f}, {tomato_xyz_cm['z']:.1f})"
+            )
+        else:
+            logger.info(
+                f"[{index+1}/{total}] Center not stable long enough ({stable_hits}/{CENTER_STABLE_FRAMES}); "
+                "using current target"
+            )
 
     # Save current pose
     q_current = arm.joint_angles.copy()
@@ -358,44 +590,144 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total):
     _ensure_gripper_open(driver, duration_ms=450)
     time.sleep(0.4)
 
-    # Solve IK for cut point with robust fallback near the stem region.
+    # Solve Jacobian-DLS on stem cut target (1cm offset by default).
     accepted, solved, err, iters, q_cut, used_target = _solve_ik_with_fallback(
-        arm, q_current, target_m, cut_pt
+        arm, q_current, cut_target_m
     )
     logger.info(
-        f"[{index+1}/{total}] IK: solved={solved}, err={err:.4f}m, iters={iters}, "
+        f"[{index+1}/{total}] Stem solve: solved={solved}, err={err:.4f}m, iters={iters}, "
         f"accepted={accepted}"
     )
 
     if not accepted:
-        logger.warning(f"[{index+1}/{total}] IK failed after fallback retries — skipping")
+        logger.warning(f"[{index+1}/{total}] Stem solve failed — skipping")
         arm.set_joint_angles(q_current)
         return False
 
-    if np.linalg.norm(np.array(used_target) - np.array(cut_pt)) > 1e-6:
+    if np.linalg.norm(np.array(used_target) - np.array(target_m)) > 1e-6:
         logger.warning(
-            f"[{index+1}/{total}] Using fallback cut target: "
+            f"[{index+1}/{total}] Using fallback motion target: "
             f"[{used_target[0]:.3f}, {used_target[1]:.3f}, {used_target[2]:.3f}]m"
         )
 
     # Move: current position → cut point
-    logger.info(f"[{index+1}/{total}] Approaching stem...")
+    logger.info(f"[{index+1}/{total}] Approaching tomato center...")
     if DRY_RUN:
         _log_dry_run(f"[{index+1}/{total}] Moving to cut point")
     execute_trajectory(arm, driver, q_current, q_cut,
                        steps=TRAJ_STEPS_APPROACH, duration_ms=MOVE_DURATION_MS)
 
+    # Jacobian iterative correction from moved pose to stem cut target.
+    corr_target = np.array(cut_target_m, dtype=float)
+    converged, q_corr, corr_err, corr_iters = _iterative_jacobian_correction(
+        arm, driver, corr_target, q_cut, index, total
+    )
+    q_cut = q_corr
+    logger.info(
+        f"[{index+1}/{total}] Jacobian correction: converged={converged}, "
+        f"final_err={corr_err:.4f}m, iters={corr_iters}"
+    )
+    if not converged:
+        logger.warning(
+            f"[{index+1}/{total}] Jacobian correction residual={corr_err*1000.0:.1f}mm — "
+            "proceeding with cut at best-effort position"
+        )
+
     # Settling delay
     time.sleep(0.3)
+
+    # Visual relock: re-detect center after approach and correct if drifted.
+    if detector is not None and cap is not None and CENTER_RELOCK_ENABLED:
+        for relock_iter in range(1, max(1, CENTER_RELOCK_MAX_ITERS) + 1):
+            relock_xyz_cm, relock_hits = _refine_target_xyz(
+                detector,
+                cap,
+                tomato_xyz_cm,
+                window_s=CENTER_RELOCK_S,
+            )
+            if relock_hits < CENTER_RELOCK_MIN_HITS:
+                msg = (
+                    f"[{index+1}/{total}] Re-lock {relock_iter}: insufficient re-detection hits "
+                    f"({relock_hits} < {CENTER_RELOCK_MIN_HITS})"
+                )
+                if EXACT_CENTER_TARGET:
+                    logger.warning(msg + " — aborting cut in exact mode")
+                    arm.set_joint_angles(q_current)
+                    return False
+                logger.info(msg + " — keeping current center target")
+                break
+
+            relock_center_m = camera_to_arm_frame(relock_xyz_cm)
+            relock_target_m, relock_projected = _stem_cut_point_from_center(relock_center_m, arm)
+            center_shift_m = float(np.linalg.norm(relock_target_m - corr_target))
+            logger.info(
+                f"[{index+1}/{total}] Re-lock {relock_iter}: stem-target shift={center_shift_m*1000.0:.1f}mm"
+            )
+            if center_shift_m <= CENTER_RELOCK_THRESH_M:
+                break
+
+            if EXACT_CENTER_TARGET and (relock_projected or (not arm.is_reachable(relock_target_m))):
+                logger.warning(
+                    f"[{index+1}/{total}] Re-lock target outside reach in exact mode; "
+                    "skipping cut to avoid wrong position"
+                )
+                arm.set_joint_angles(q_current)
+                return False
+
+            q_now = arm.joint_angles.copy()
+            accepted2, solved2, err2, iters2, q_relock, _ = _solve_ik_with_fallback(
+                arm, q_now, relock_target_m
+            )
+            logger.info(
+                f"[{index+1}/{total}] Re-lock solve: solved={solved2}, err={err2:.4f}m, "
+                f"iters={iters2}, accepted={accepted2}"
+            )
+            if not accepted2:
+                logger.warning(
+                    f"[{index+1}/{total}] Re-lock center solve failed; "
+                    "skipping cut to avoid wrong position"
+                )
+                arm.set_joint_angles(q_current)
+                return False
+
+            execute_trajectory(
+                arm,
+                driver,
+                q_now,
+                q_relock,
+                steps=max(10, TRAJ_STEPS_APPROACH // 2),
+                duration_ms=max(900, MOVE_DURATION_MS // 2),
+            )
+            converged2, q_corr2, corr_err2, corr_iters2 = _iterative_jacobian_correction(
+                arm,
+                driver,
+                relock_target_m,
+                q_relock,
+                index,
+                total,
+            )
+            logger.info(
+                f"[{index+1}/{total}] Re-lock Jacobian: converged={converged2}, "
+                f"final_err={corr_err2:.4f}m, iters={corr_iters2}"
+            )
+            if not converged2:
+                logger.warning(
+                    f"[{index+1}/{total}] Re-lock Jacobian residual={corr_err2*1000.0:.1f}mm — "
+                    "proceeding with cut at best-effort position"
+                )
+
+            q_cut = q_corr2
+            corr_target = relock_target_m
+            tomato_xyz_cm = relock_xyz_cm
+            time.sleep(0.2)
 
     # Close gripper / scissors to cut the stem
     logger.info(f"[{index+1}/{total}] {'[SKIPPED-DRY-RUN/NO-CUT]' if DRY_RUN or NO_CUT else 'CUTTING'} stem...")
     if not (DRY_RUN or NO_CUT):
-        driver.gripper_close(duration_ms=CUT_GRIPPER_CLOSE_MS)
-        time.sleep(GRIPPER_DELAY_S)
+        _perform_fast_cut(driver, index=index, total=total)
         logger.info(f"[{index+1}/{total}] Cut complete!")
-        _ensure_gripper_open(driver, duration_ms=450)
         time.sleep(0.3)
+        # post-cut actions removed
     else:
         if DRY_RUN:
             _log_dry_run(f"[{index+1}/{total}] Closing gripper ({CUT_GRIPPER_CLOSE_MS}ms)")
@@ -408,19 +740,181 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total):
     return True
 
 
+class _FfmpegCamera:
+    """Minimal cv2.VideoCapture-compatible wrapper using an ffmpeg subprocess pipe.
+
+    Used as a fallback when OpenCV's own V4L2 backend is unavailable (e.g. on
+    Raspberry Pi OS with a pip-installed opencv-python wheel that was built
+    without V4L2 support).
+    """
+
+    WIDTH  = 640
+    HEIGHT = 480
+
+    def __init__(self, device: str):
+        import subprocess
+        self._w = self.WIDTH
+        self._h = self.HEIGHT
+        cmd = [
+            "ffmpeg", "-loglevel", "error",
+            "-f", "v4l2",
+            "-video_size", f"{self._w}x{self._h}",
+            "-i", device,
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-",
+        ]
+        self._proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=self._w * self._h * 3 * 4,
+        )
+        self._frame_bytes = self._w * self._h * 3
+        self._opened = self._proc.poll() is None
+
+    def isOpened(self):
+        return self._opened and self._proc.poll() is None
+
+    def read(self):
+        if not self.isOpened():
+            return False, None
+        raw = self._proc.stdout.read(self._frame_bytes)
+        if len(raw) != self._frame_bytes:
+            self._opened = False
+            return False, None
+        frame = np.frombuffer(raw, dtype=np.uint8).reshape((self._h, self._w, 3))
+        return True, frame.copy()
+
+    def grab(self):
+        """Discard one frame to emulate cv2.VideoCapture.grab()."""
+        ok, _ = self.read()
+        return ok
+
+    def get(self, prop_id):
+        if prop_id == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self._w)
+        if prop_id == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self._h)
+        return 0.0
+
+    def set(self, prop_id, value):
+        return False  # resolution fixed at construction time
+
+    def release(self):
+        self._opened = False
+        try:
+            self._proc.terminate()
+            self._proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+class ThreadedCamera:
+    """Background-threaded camera that always serves the latest frame.
+
+    Inspired by the Hiwonder OpenCV_Camera pattern: a dedicated capture thread
+    runs at ~100 fps, storing only the most recent frame.  The main thread
+    calls read() / grab() without ever blocking on I/O — eliminating the
+    stale-buffer lag that causes detection jitter.
+
+    Fully drop-in compatible with cv2.VideoCapture and _FfmpegCamera:
+    isOpened() / read() / grab() / get() / set() / release().
+    """
+
+    TARGET_FPS = 60   # capture target; actual fps limited by hardware
+
+    def __init__(self, backend_cap):
+        """Wrap an already-opened backend camera (VideoCapture or _FfmpegCamera)."""
+        self._cap = backend_cap
+        self._lock = threading.Lock()
+        self._frame = None
+        self._ret = False
+        self._running = False
+        self._thread = None
+
+        if self._cap.isOpened():
+            self._running = True
+            self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self._thread.start()
+            # Wait up to 1 s for the first frame to arrive.
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                with self._lock:
+                    if self._frame is not None:
+                        break
+                time.sleep(0.01)
+
+    def _capture_loop(self):
+        interval = 1.0 / self.TARGET_FPS
+        while self._running:
+            t0 = time.time()
+            ret, frame = self._cap.read()
+            if ret and frame is not None:
+                with self._lock:
+                    self._ret = True
+                    self._frame = frame
+            else:
+                with self._lock:
+                    self._ret = False
+            elapsed = time.time() - t0
+            sleep_t = max(0.0, interval - elapsed)
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+
+    def isOpened(self):
+        return self._running and self._cap.isOpened()
+
+    def read(self):
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            return self._ret, self._frame.copy()
+
+    def grab(self):
+        """Non-blocking grab — background thread already discarded stale frames."""
+        with self._lock:
+            return self._ret
+
+    def get(self, prop_id):
+        return self._cap.get(prop_id)
+
+    def set(self, prop_id, value):
+        return self._cap.set(prop_id, value)
+
+    def release(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._cap.release()
+
+
 def _open_low_latency_camera(camera_index):
-    """Open camera with low-latency settings suitable for Raspberry Pi 5."""
+    """Open camera with low-latency settings suitable for Raspberry Pi 5.
+
+    Tries OpenCV native backends first; falls back to an ffmpeg-pipe wrapper
+    when the installed OpenCV wheel lacks V4L2 support (common on RPi OS).
+    Wraps the result in a ThreadedCamera for zero-lag latest-frame reads.
+    """
     cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
     if not cap.isOpened():
         cap = cv2.VideoCapture(camera_index)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 60)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        logger.info("Camera %d opened via OpenCV; wrapping in ThreadedCamera.", camera_index)
+        return ThreadedCamera(cap)
+    # OpenCV native failed — fall back to ffmpeg pipe
+    logger.warning("OpenCV cannot open camera %d natively; falling back to ffmpeg pipe.", camera_index)
+    device = f"/dev/video{camera_index}"
+    cap = _FfmpegCamera(device)
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera {camera_index}")
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
+        raise RuntimeError(f"Cannot open camera {camera_index} (tried OpenCV and ffmpeg pipe)")
+    logger.info("Camera %d opened via ffmpeg pipe; wrapping in ThreadedCamera.", camera_index)
+    return ThreadedCamera(cap)
 
 
 # ── Safety utilities ──────────────────────────────────────────────────────────
@@ -450,7 +944,108 @@ def _ensure_gripper_open(driver, duration_ms=450):
     driver.gripper_open(duration_ms=duration_ms)
 
 
+def _perform_fast_cut(driver, index=None, total=None):
+    """Fast close/open cycle on servo ID1 at the cut target."""
+    tag = ""
+    if index is not None and total is not None:
+        tag = f"[{index+1}/{total}] "
+
+    if DRY_RUN:
+        _log_dry_run(f"{tag}FAST CUT: Servo1 close {CUT_GRIPPER_CLOSE_MS}ms, hold 0.25s, open 400ms")
+        time.sleep(0.25)
+        return
+
+    # Direct ID1 command for deterministic quick close/open.
+    driver.move_servo(1, 700, duration_ms=CUT_GRIPPER_CLOSE_MS)
+    time.sleep(0.25)
+    driver.move_servo(1, 350, duration_ms=400)
+
+
+def _load_action_group_rows(action_file):
+    """Load ActionGroup rows from a .d6a SQLite file."""
+    conn = sqlite3.connect(action_file)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT `Time`, Servo1, Servo2, Servo3, Servo4, Servo5, Servo6 "
+            "FROM ActionGroup ORDER BY `Index` ASC"
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def _play_action_group_file(driver, action_file, label=None):
+    """Execute a .d6a action file using ActionGroupController (official Hiwonder path)."""
+    if not ACTION_GROUP_ENABLED:
+        return False
+
+    name = label or os.path.basename(action_file)
+    if not os.path.isfile(action_file):
+        logger.warning(f"Action file not found, skipping: {action_file}")
+        return False
+
+    if DRY_RUN:
+        _log_dry_run(f"Running action group: {name}")
+        return True
+
+    # Preferred path: official Hiwonder controller via SDK UART board.
+    try:
+        from action_group_controller import ActionGroupController
+        sdk_board = getattr(driver, '_sdk_board', None)
+        if sdk_board is not None:
+            agc = ActionGroupController(board=sdk_board)
+            logger.info(f"Running action group: {name} (ActionGroupController)")
+            agc.runAction(action_file)
+            return True
+    except Exception as e:
+        logger.warning(f"ActionGroupController unavailable for {name}: {e}")
+
+    # Fallback path: play rows through ServoDriver so UART/I2C backends also work.
+    try:
+        rows = _load_action_group_rows(action_file)
+    except Exception as e:
+        logger.warning(f"Failed to read action file {action_file}: {e}")
+        return False
+
+    if not rows:
+        logger.warning(f"No ActionGroup rows in {action_file}")
+        return False
+
+    logger.info(f"Running action group: {name} (driver fallback, {len(rows)} steps)")
+    for row in rows:
+        step_ms = int(max(ACTION_GROUP_MIN_STEP_MS, float(row[0]) * ACTION_GROUP_TIME_SCALE))
+        pulses = {
+            1: int(max(0, min(1000, row[1]))),
+            3: int(max(0, min(1000, row[3]))),
+            4: int(max(0, min(1000, row[4]))),
+            5: int(max(0, min(1000, row[5]))),
+            6: int(max(0, min(1000, row[6]))),
+        }
+        driver.move_servos(pulses, duration_ms=step_ms)
+        time.sleep(step_ms / 1000.0)
+
+    return True
+
+
+def _run_post_cut_actions(driver, index, total):
+    """Run optional post-cut choreography (e.g. grab-forward, transfer-left)."""
+    if not POST_CUT_ACTION_FILES:
+        return
+
+    for action_name in POST_CUT_ACTION_FILES:
+        action_path = action_name
+        if not os.path.isabs(action_path):
+            action_path = os.path.join(os.path.dirname(__file__), action_name)
+        ok = _play_action_group_file(driver, action_path, label=action_name)
+        if ok:
+            logger.info(f"[{index+1}/{total}] Action complete: {action_name}")
+
+
 def _drain_camera_frames(cap, count=FRAME_DRAIN_COUNT):
+    # ThreadedCamera always serves the latest frame — no explicit drain needed.
+    if isinstance(cap, ThreadedCamera):
+        return
     for _ in range(max(0, count)):
         cap.grab()
 
@@ -584,9 +1179,94 @@ def _refine_target_xyz(detector, cap, seed_xyz_cm, window_s=PREMOVE_REFINE_S):
         return seed_xyz_cm, 0
 
     arr = np.array(samples, dtype=float)
+    # Reject depth outliers (median + MAD) before final center selection.
+    z_vals = arr[:, 2]
+    z_med = float(np.median(z_vals))
+    z_mad = float(np.median(np.abs(z_vals - z_med)))
+    if z_mad > 1e-6:
+        z_mask = np.abs(z_vals - z_med) <= max(2.5 * z_mad, 2.0)
+        if np.any(z_mask):
+            arr = arr[z_mask]
+
     med = np.median(arr, axis=0)
     refined = {"x": float(med[0]), "y": float(med[1]), "z": float(med[2])}
-    return refined, int(len(samples))
+    return refined, int(arr.shape[0])
+
+
+def _wait_center_stable(detector, cap, seed_xyz_cm, window_s=CENTER_STABLE_WINDOW_S):
+    """Wait for stable center over consecutive frames before approach."""
+    stable_needed = max(1, int(CENTER_STABLE_FRAMES))
+    px_thresh = float(max(0.5, CENTER_STABLE_PIXEL_THRESH))
+    deadline = time.time() + max(0.2, float(window_s))
+
+    seed = np.array([
+        float(seed_xyz_cm["x"]),
+        float(seed_xyz_cm["y"]),
+        float(seed_xyz_cm["z"]),
+    ], dtype=float)
+
+    last_c = None
+    stable_count = 0
+    best_xyz = dict(seed_xyz_cm)
+
+    while time.time() < deadline:
+        _drain_camera_frames(cap, count=1)
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            continue
+
+        detections = detector.detect(frame, use_tracker=False)
+        if not detections:
+            stable_count = 0
+            continue
+
+        best = None
+        best_d = 1e9
+        for det in detections:
+            xyz = det.get("xyz_cm")
+            box = det.get("bbox") or det.get("bbox_px")
+            if not xyz:
+                continue
+
+            v = np.array([float(xyz["x"]), float(xyz["y"]), float(xyz["z"])], dtype=float)
+            d = float(np.linalg.norm(v - seed))
+            if d >= best_d:
+                continue
+
+            if box is not None and len(box) >= 4:
+                cx = float((box[0] + box[2]) / 2.0)
+                cy = float((box[1] + box[3]) / 2.0)
+            else:
+                # Fallback if detector doesn't provide pixel bbox.
+                cx = float(v[0])
+                cy = float(v[1])
+
+            best_d = d
+            best = (cx, cy, xyz)
+
+        if best is None:
+            stable_count = 0
+            continue
+
+        cx, cy, xyz = best
+        best_xyz = dict(xyz)
+        if last_c is None:
+            last_c = (cx, cy)
+            stable_count = 1
+            continue
+
+        dx = abs(cx - last_c[0])
+        dy = abs(cy - last_c[1])
+        last_c = (cx, cy)
+
+        if dx <= px_thresh and dy <= px_thresh:
+            stable_count += 1
+            if stable_count >= stable_needed:
+                return best_xyz, True, stable_count
+        else:
+            stable_count = 0
+
+    return best_xyz, False, stable_count
 
 
 def _harvest_sequence(arm, driver, tomatoes, detector=None, cap=None):
@@ -615,10 +1295,13 @@ def _harvest_sequence(arm, driver, tomatoes, detector=None, cap=None):
             else:
                 logger.info(f"[{i+1}/{n}] No stable refine sample; using scan target")
 
-        success = harvest_single_tomato(arm, driver, xyz_cm, i, n)
+        success = harvest_single_tomato(arm, driver, xyz_cm, i, n, detector=detector, cap=cap)
         if success:
             harvested += 1
             logger.info(f"Tomato #{i+1} harvested successfully!")
+            if SINGLE_CUT_THEN_HOME:
+                logger.info("Single-cut mode: stopping harvest after first successful cut.")
+                break
         else:
             logger.info(f"Tomato #{i+1} skipped.")
         time.sleep(0.2)
@@ -644,12 +1327,30 @@ def run_harvesting(sim_mode=False):
     logger.info(
         f"3D mapping: CAMERA_OFFSET_M={CAMERA_OFFSET_M.tolist()}, "
         f"CAMERA_AXIS_SCALE={CAMERA_AXIS_SCALE.tolist()}, "
+        f"CAMERA_LATERAL_SIGN={CAMERA_LATERAL_SIGN:.2f}, "
+        f"CAMERA_LATERAL_GAIN={CAMERA_LATERAL_GAIN:.2f}, "
+        f"CAMERA_VERTICAL_SIGN={CAMERA_VERTICAL_SIGN:.2f}, "
         f"ARM_TARGET_AFFINE={ARM_TARGET_AFFINE.tolist()}, "
-        f"ARM_TARGET_BIAS_M={ARM_TARGET_BIAS_M.tolist()}"
+        f"ARM_TARGET_BIAS_M={ARM_TARGET_BIAS_M.tolist()}, "
+        f"CAMERA_MAPPING_MODE={'hand_eye' if HAND_EYE_CAMERA_TO_ARM_T is not None else 'coarse'}, "
+        f"EXACT_CENTER_TARGET={EXACT_CENTER_TARGET}"
+    )
+    if HAND_EYE_CAMERA_TO_ARM_T is not None:
+        logger.info(f"Loaded hand-eye transform from {HAND_EYE_FILE}")
+    else:
+        logger.info(
+            "No hand-eye transform file found; using coarse camera-to-arm mapping."
+        )
+    if os.path.isfile(ARM_BIAS_FILE):
+        logger.info(f"Loaded arm bias calibration from {ARM_BIAS_FILE}")
+    logger.info(
+        "Vision calibration: "
+        f"FOCAL_LENGTH_PX={'AUTO-DEFAULT(700)' if FOCAL_LENGTH_PX is None else FOCAL_LENGTH_PX}, "
+        "(set env FOCAL_LENGTH_PX for calibrated depth)"
     )
 
     # Initialise subsystems
-    detector = TomatoDetector(imgsz=416)
+    detector = TomatoDetector(imgsz=416, focal_length_px=FOCAL_LENGTH_PX)
     arm = FiveDOFArm()
     driver = ServoDriver(mode=mode)
 
@@ -659,7 +1360,7 @@ def run_harvesting(sim_mode=False):
     logger.info("Moving arm to home base position...")
     if not DRY_RUN:
         arm.set_joint_angles(home_angles)
-        driver.move_servos(home_pulses, duration_ms=3500)
+        driver.move_servos(home_pulses, duration_ms=6000)
     else:
         _log_dry_run(f"Setting arm to home: [{', '.join([f'{a:.2f}' for a in home_angles])}]")
     time.sleep(2.5)
@@ -736,14 +1437,18 @@ def run_harvesting(sim_mode=False):
                 q_current = arm.joint_angles.copy()
                 execute_trajectory(arm, driver, q_current, home_angles,
                                    steps=TRAJ_STEPS_RETRACT,
-                                   duration_ms=MOVE_DURATION_MS)
+                                   duration_ms=RETRACT_DURATION_MS)
                 arm.set_joint_angles(home_angles)
-                driver.move_servos(home_pulses, duration_ms=1800)
+                driver.move_servos(home_pulses, duration_ms=6000)
             else:
                 _log_dry_run("Returning arm to home base")
             time.sleep(RETRACT_DELAY_S)
 
             logger.info(f"Cycle {cycle} complete. Ready for next scan.\n")
+
+            if SINGLE_CUT_THEN_HOME and harvested > 0:
+                logger.info("Single-cut mode: cut completed, returned home, exiting.")
+                break
             
             if SINGLE_PASS:
                 logger.info("Single-pass mode: exiting after 1 cycle")
@@ -761,8 +1466,8 @@ def run_harvesting(sim_mode=False):
         logger.info("Parking arm (safe shutdown)...")
         if not DRY_RUN:
             _ensure_gripper_open(driver, duration_ms=450)
-            driver.go_park(duration_ms=2200)
-            time.sleep(1.5)
+            driver.go_park(duration_ms=6000)
+            time.sleep(2.0)
         else:
             _log_dry_run("Parking arm")
         driver.close()
@@ -819,7 +1524,7 @@ def main():
         
         if not DRY_RUN:
             arm.set_joint_angles(home_angles)
-            driver.move_servos(home_pulses, duration_ms=3500)
+            driver.move_servos(home_pulses, duration_ms=6000)
         else:
             _log_dry_run(f"Setting arm to home: [{', '.join([f'{a:.2f}' for a in home_angles])}]")
         time.sleep(2.5)
@@ -854,17 +1559,23 @@ def main():
                             "Cannot harvest. Move closer."
                         )
                         continue
-                    target_m = camera_to_arm_frame(xyz_cm)
-                    target_m, was_projected = _project_to_reachable(target_m, arm)
-                    if was_projected:
+                    center_target_m = camera_to_arm_frame(xyz_cm)
+                    if EXACT_CENTER_TARGET and (not arm.is_reachable(center_target_m)):
                         logger.warning(
-                            f"[WARN] Target outside reach; projecting to {target_m.tolist()}"
+                            f"[WARN] Exact center target outside reach; skipping: {center_target_m.tolist()}"
                         )
-                    cut_pt, cut_projected = _stem_cut_point_from_center(target_m, arm)
-                    if cut_projected:
-                        logger.warning(
-                            f"[WARN] Cut point projected to reachable point: {cut_pt.tolist()}"
-                        )
+                        continue
+                    if not EXACT_CENTER_TARGET:
+                        center_target_m, was_projected = _project_to_reachable(center_target_m, arm)
+                        if was_projected:
+                            logger.warning(
+                                f"[WARN] Target outside reach; projecting to {center_target_m.tolist()}"
+                            )
+
+                    cut_target_m, cut_projected = _stem_cut_point_from_center(center_target_m, arm)
+                    if EXACT_CENTER_TARGET and cut_projected:
+                        logger.warning("[WARN] Stem cut target outside reach in exact mode; skipping.")
+                        continue
                     q_current = arm.joint_angles.copy()
                     if DRY_RUN:
                         _log_dry_run(f"[INFO] Tomato #{i+1}: Opening gripper (450ms)")
@@ -872,14 +1583,14 @@ def main():
                         _ensure_gripper_open(driver, duration_ms=450)
                     time.sleep(0.4)
                     accepted, solved, err, iters, q_cut, used_target = _solve_ik_with_fallback(
-                        arm, q_current, target_m, cut_pt
+                        arm, q_current, cut_target_m
                     )
                     logger.info(
-                        f"[INFO] Tomato #{i+1} IK: solved={solved}, err={err:.4f}m, "
+                        f"[INFO] Tomato #{i+1} stem solve: solved={solved}, err={err:.4f}m, "
                         f"iters={iters}, accepted={accepted}"
                     )
                     if not accepted:
-                        logger.warning(f"[WARN] IK fallback failed, skipping.")
+                        logger.warning(f"[WARN] Stem solve failed, skipping.")
                         if not DRY_RUN:
                             arm.set_joint_angles(q_current)
                         continue
@@ -892,9 +1603,8 @@ def main():
                     
                     if not (DRY_RUN or NO_CUT):
                         logger.info(f"[INFO] CUTTING stem of tomato #{i+1}...")
-                        driver.gripper_close(duration_ms=CUT_GRIPPER_CLOSE_MS)
-                        time.sleep(GRIPPER_DELAY_S)
-                        _ensure_gripper_open(driver, duration_ms=450)
+                        _perform_fast_cut(driver, index=i, total=len(tomatoes))
+                        # post-cut actions removed
                     else:
                         if DRY_RUN:
                             _log_dry_run(f"[INFO] Tomato #{i+1}: Closing gripper ({CUT_GRIPPER_CLOSE_MS}ms)")
@@ -912,9 +1622,9 @@ def main():
                     _ensure_gripper_open(driver, duration_ms=450)
                     q_current = arm.joint_angles.copy()
                     execute_trajectory(arm, driver, q_current, home_angles, 
-                                     steps=TRAJ_STEPS_RETRACT, duration_ms=MOVE_DURATION_MS)
+                                     steps=TRAJ_STEPS_RETRACT, duration_ms=RETRACT_DURATION_MS)
                     arm.set_joint_angles(home_angles)
-                    driver.move_servos(home_pulses, duration_ms=1800)
+                    driver.move_servos(home_pulses, duration_ms=6000)
                 else:
                     _log_dry_run("Returning arm to home position")
                 time.sleep(RETRACT_DELAY_S)
@@ -927,8 +1637,8 @@ def main():
         
         if not DRY_RUN:
             _ensure_gripper_open(driver, duration_ms=450)
-            driver.go_park(duration_ms=2200)
-            time.sleep(1.5)
+            driver.go_park(duration_ms=6000)
+            time.sleep(2.0)
         else:
             _log_dry_run("Parking arm")
         driver.close()
