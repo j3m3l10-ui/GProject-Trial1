@@ -54,9 +54,9 @@ logger = logging.getLogger(__name__)
 DRY_RUN = False        # If True, log all moves but don't send servo commands
 NO_CUT = False         # If True, skip the actual gripper close (cutting) action
 NO_CONFIRM = False     # If True, skip confirmation prompts
-SINGLE_PASS = True     # If True, run only one cycle then exit
+SINGLE_PASS = False    # If True, run only one cycle then exit
 TEST_CYCLES = None     # If set, limit total cycles to this number
-SINGLE_CUT_THEN_HOME = False  # If True, stop after first successful cut
+SINGLE_CUT_THEN_HOME = True  # If True, stop after first successful cut
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 SCAN_DURATION_S      = 3.0    # seconds to scan for tomatoes
@@ -64,19 +64,13 @@ SCAN_ANALYSIS_S      = 1.2    # seconds for heavy authenticity scan pass
 CONFIRM_DELAY_S      = 3.0    # seconds camera must confirm before arm moves
 MAX_HARVEST_PER_CYCLE = 3     # max tomatoes per harvest cycle
 MIN_SIGHTINGS        = 2      # min frames a tomato must appear in to be confirmed
-MOVE_DURATION_MS     = 8000   # slower trajectory timing for safer arm motion
-RETRACT_DURATION_MS  = 12000  # slow return to protect components
+MOVE_DURATION_MS     = 4000   # slower trajectory timing for safer arm motion
+RETRACT_DURATION_MS  = 8000   # slow return to protect components
 GRIPPER_DELAY_S      = 0.6    # wait after gripper close (cutting)
 RETRACT_DELAY_S      = 1.0    # wait after returning home
 TOMATO_RADIUS_M      = 0.035  # average tomato radius in metres
 # Default target reference is the detected center point (0cm Z offset).
 STEM_VERTICAL_OFFSET_M = float(os.getenv("STEM_VERTICAL_OFFSET_M", "0.000"))
-# Depth pullback to compensate for end-effector / gripper-tip protrusion past the
-# wrist. The detected camera depth places the WRIST at the tomato; subtracting
-# this offset along arm-frame X (camera depth axis) lands the gripper tip
-# exactly at the stem instead of overshooting. Override with env var.
-ARM_TOTAL_LENGTH_M     = float(os.getenv("ARM_TOTAL_LENGTH_M", "0.36"))
-STEM_DEPTH_OFFSET_M    = float(os.getenv("STEM_DEPTH_OFFSET_M", "0.030"))
 CUT_GRIPPER_CLOSE_MS = int(os.getenv("CUT_GRIPPER_CLOSE_MS", "200"))
 CAMERA_INDEX         = 0      # default camera index
 TRAJ_STEPS_APPROACH  = 50     # more interpolation points for smoother approach
@@ -90,7 +84,7 @@ POST_CUT_ACTION_FILES = [
     p.strip()
     for p in os.getenv(
         "POST_CUT_ACTION_FILES",
-        ""
+        "grab_forward_pro.d6a,transfer_to_left.d6a"
     ).split(",")
     if p.strip()
 ]
@@ -124,19 +118,6 @@ CENTER_RELOCK_S = float(os.getenv("CENTER_RELOCK_S", "0.6"))
 CENTER_RELOCK_THRESH_M = float(os.getenv("CENTER_RELOCK_THRESH_M", "0.010"))
 CENTER_RELOCK_MAX_ITERS = int(os.getenv("CENTER_RELOCK_MAX_ITERS", "2"))
 CENTER_RELOCK_MIN_HITS = int(os.getenv("CENTER_RELOCK_MIN_HITS", str(PREMOVE_REFINE_MIN_HITS)))
-# Closed-loop pixel-space visual-servo refinement (port of intelligent_grasp.py PID idea):
-# nudge arm-frame Y/Z until the tomato's pixel center sits inside the image-centre dead-zone
-# for VS_STABLE_FRAMES consecutive frames, then commit to the cut. Removes residual
-# focal-length / mounting bias that 1-shot 3D estimation cannot correct.
-VS_ENABLED = os.getenv("VS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
-VS_PIXEL_TOL = float(os.getenv("VS_PIXEL_TOL", "8.0"))         # pixel dead-zone (per axis)
-VS_MAX_ITERS = int(os.getenv("VS_MAX_ITERS", "6"))
-VS_STABLE_FRAMES = int(os.getenv("VS_STABLE_FRAMES", "3"))
-VS_KP_LATERAL = float(os.getenv("VS_KP_LATERAL", "0.6"))      # gain on (px*depth/f)
-VS_KP_VERTICAL = float(os.getenv("VS_KP_VERTICAL", "0.6"))
-VS_MAX_STEP_M = float(os.getenv("VS_MAX_STEP_M", "0.020"))    # per-iter clamp (2cm)
-VS_STEP_DURATION_MS = int(os.getenv("VS_STEP_DURATION_MS", "900"))
-VS_FOCAL_PX_FALLBACK = float(os.getenv("VS_FOCAL_PX_FALLBACK", "700.0"))
 EXACT_CENTER_TARGET = os.getenv("EXACT_CENTER_TARGET", "0").strip().lower() not in {
     "0", "false", "no"
 }
@@ -335,40 +316,14 @@ def _project_to_reachable(target_m, arm, safety_margin_m=0.02, min_z=None):
 
 
 def _stem_cut_point_from_center(target_m, arm):
-    """Compute the gripper cut point 1 cm in front of the tomato surface.
-
-    Uses proper geometry: the approach direction is computed from the arm base
-    toward the tomato center (biased slightly upward to align with the stem at
-    the top).  The end-effector is placed TOMATO_RADIUS_M + 0.01 m from the
-    tomato centre along that direction, ensuring the scissors arrive exactly
-    1 cm from the tomato surface regardless of depth or lateral offset.
-    """
-    center = np.array(target_m, dtype=float)
-    base   = np.array(arm.base_pos, dtype=float)
-
-    # Bias the aim point toward the stem attachment (top of tomato)
-    stem_aim = center.copy()
-    stem_aim[2] += TOMATO_RADIUS_M * 0.5
-
-    direction = stem_aim - base
-    dist = float(np.linalg.norm(direction))
-    if dist < 1e-6:
-        direction = np.array([1.0, 0.0, 0.0])
-    else:
-        direction = direction / dist
-
-    # Place 1 cm (CUT_GAP_M) in front of the tomato surface
-    CUT_GAP_M = 0.01
-    cut_pt = center - direction * (TOMATO_RADIUS_M + CUT_GAP_M)
-
-    # Configurable additional vertical offset (STEM_VERTICAL_OFFSET_M, default 0)
+    """Target point as center + configurable vertical offset in arm-frame Z."""
+    cut_pt = np.array(target_m, dtype=float).copy()
     cut_pt[2] += STEM_VERTICAL_OFFSET_M
-
-    # Project into reachable workspace; never go below the tomato bottom
+    # Never let reach projection drag the stem target below the center+offset.
     cut_pt, was_projected = _project_to_reachable(
         cut_pt,
         arm,
-        min_z=float(center[2] - TOMATO_RADIUS_M),
+        min_z=float(target_m[2] + STEM_VERTICAL_OFFSET_M),
     )
     return cut_pt, was_projected
 
@@ -465,10 +420,10 @@ def execute_trajectory(arm, driver, q_start, q_end, steps, duration_ms):
     backend = getattr(driver, "_backend", "")
     if backend.startswith("i2c"):
         steps = max(4, min(int(steps), 10))
-        min_step_ms = 220
+        min_step_ms = 180
     else:
         steps = max(4, int(steps))
-        min_step_ms = 140
+        min_step_ms = 80
 
     traj = interpolate_trajectory(q_start, q_end, steps)
     step_duration = max(min_step_ms, duration_ms // steps)
@@ -543,138 +498,6 @@ def _iterative_jacobian_correction(arm, driver, target_m, q_start, index, total)
     return False, q_curr, last_err, JAC_CORR_MAX_ITERS
 
 
-# ── Pixel-space visual servo refinement ──────────────────────────────────────
-# After the open-loop IK approach the camera re-detects the tomato and the arm
-# is nudged in lateral (Y) and vertical (Z) until the detected pixel centre
-# sits inside VS_PIXEL_TOL of the true image optical centre for
-# VS_STABLE_FRAMES consecutive frames.
-
-def _visual_servo_refine(arm, driver, detector, cap, corr_target, q_cut, index, total):
-    """Depth-scaled pixel-space closed-loop visual servo.
-
-    Sign convention (hand-in-eye, camera facing forward):
-      pixel err_x > 0  →  tomato is RIGHT  of centre  →  arm_Y must increase
-                          (arm_y = CAMERA_LATERAL_SIGN * cam_x, so correction
-                           in arm-Y = +err_x * scale * CAMERA_LATERAL_SIGN)
-      pixel err_y > 0  →  tomato is BELOW  centre     →  arm_Z must decrease
-                          (arm_z = CAMERA_VERTICAL_SIGN * cam_y, so correction
-                           in arm-Z = +err_y * scale * CAMERA_VERTICAL_SIGN)
-    """
-    if not VS_ENABLED or detector is None or cap is None:
-        return corr_target, q_cut
-
-    target  = np.array(corr_target, dtype=float)
-    q_curr  = np.array(q_cut, dtype=float).copy()
-    focal_px = FOCAL_LENGTH_PX if FOCAL_LENGTH_PX is not None else VS_FOCAL_PX_FALLBACK
-
-    # True optical centre of a 640×480 image
-    IMG_CX = 320.0
-    IMG_CY = 240.0
-    stable_count = 0
-
-    for vs_iter in range(1, max(1, VS_MAX_ITERS) + 1):
-        _drain_camera_frames(cap, count=1)
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            continue
-
-        detections = detector.detect(frame, use_tracker=False)
-        if not detections:
-            stable_count = 0
-            logger.info(f"[{index+1}/{total}] VS iter={vs_iter}: no detection")
-            continue
-
-        # Find detection centroid closest to image optical centre
-        best = None
-        best_dist_px = 1e9
-        for det in detections:
-            px_d = float(det["center_px"][0])
-            py_d = float(det["center_px"][1])
-            d = float(np.hypot(px_d - IMG_CX, py_d - IMG_CY))
-            if d < best_dist_px:
-                best_dist_px = d
-                best = det
-
-        if best is None:
-            stable_count = 0
-            continue
-
-        px = float(best["center_px"][0])
-        py = float(best["center_px"][1])
-        err_x = px - IMG_CX   # +ve → tomato right of optical centre
-        err_y = py - IMG_CY   # +ve → tomato below optical centre
-
-        logger.info(
-            f"[{index+1}/{total}] VS iter={vs_iter}: "
-            f"pixel_err=({err_x:+.1f}, {err_y:+.1f}), conf={best['confidence']:.2f}"
-        )
-
-        if abs(err_x) <= VS_PIXEL_TOL and abs(err_y) <= VS_PIXEL_TOL:
-            stable_count += 1
-            logger.info(
-                f"[{index+1}/{total}] VS stable {stable_count}/{VS_STABLE_FRAMES}"
-            )
-            if stable_count >= VS_STABLE_FRAMES:
-                logger.info(
-                    f"[{index+1}/{total}] VS converged after {vs_iter} iter(s)"
-                )
-                break
-        else:
-            stable_count = 0
-
-        # Depth-scaled deprojection: pixel → metres in arm frame.
-        # arm-frame X ≈ forward depth from base.
-        depth_m     = max(0.05, float(target[0]))
-        pixel_to_m  = depth_m / focal_px
-
-        # Lateral correction (arm Y): apply camera lateral sign so the arm
-        # moves the camera in the right direction to centre the tomato.
-        dy_m = float(np.clip(
-            VS_KP_LATERAL * err_x * pixel_to_m * CAMERA_LATERAL_SIGN,
-            -VS_MAX_STEP_M, VS_MAX_STEP_M,
-        ))
-        # Vertical correction (arm Z): same principle with vertical sign.
-        dz_m = float(np.clip(
-            VS_KP_VERTICAL * err_y * pixel_to_m * CAMERA_VERTICAL_SIGN,
-            -VS_MAX_STEP_M, VS_MAX_STEP_M,
-        ))
-
-        target_new = target.copy()
-        target_new[1] += dy_m
-        target_new[2] += dz_m
-
-        accepted, _, _, _, q_new, _ = _solve_ik_with_fallback(arm, q_curr, target_new)
-        if not accepted:
-            # Direct Jacobian fallback: skip IK, compute dq from J^+ @ dp
-            arm.set_joint_angles(q_curr)
-            J       = arm.jacobian(q_curr)
-            delta_p = np.array([0.0, dy_m, dz_m], dtype=float)
-            J_pinv  = np.linalg.pinv(J, rcond=1e-4)
-            dq      = J_pinv @ delta_p
-            q_new   = np.clip(
-                q_curr + dq,
-                arm.joint_limits[:, 0],
-                arm.joint_limits[:, 1],
-            )
-            arm.set_joint_angles(q_new)
-            q_new = arm.joint_angles.copy()
-            logger.info(
-                f"[{index+1}/{total}] VS iter={vs_iter}: "
-                "IK not accepted — used direct Jacobian step"
-            )
-
-        execute_trajectory(
-            arm, driver, q_curr, q_new,
-            steps=4, duration_ms=VS_STEP_DURATION_MS,
-        )
-        q_curr = q_new.copy()
-        arm.set_joint_angles(q_curr)
-        target = target_new
-        time.sleep(0.15)
-
-    return target, q_curr
-
-
 # ── Single tomato harvest action ──────────────────────────────────────────────
 def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total, detector=None, cap=None):
     """
@@ -722,8 +545,7 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total, detector=Non
 
     logger.info(f"[{index+1}/{total}] Arm-frame tomato center: "
                 f"[{center_target_m[0]:.3f}, {center_target_m[1]:.3f}, {center_target_m[2]:.3f}]m")
-    logger.info(f"[{index+1}/{total}] Stem cut target "
-                f"(Z+{STEM_VERTICAL_OFFSET_M*100.0:.1f}cm, depth-{STEM_DEPTH_OFFSET_M*100.0:.1f}cm): "
+    logger.info(f"[{index+1}/{total}] Stem cut target (+{STEM_VERTICAL_OFFSET_M*100.0:.1f}cm Z): "
                 f"[{cut_target_m[0]:.3f}, {cut_target_m[1]:.3f}, {cut_target_m[2]:.3f}]m")
 
     # Center stability gate (from provided intelligent grasp logic):
@@ -761,85 +583,143 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total, detector=Non
                 "using current target"
             )
 
-    # Save current pose (arm is at home / scan position)
+    # Save current pose
     q_current = arm.joint_angles.copy()
 
-    # ── Step 1: Open gripper ──────────────────────────────────────────────────
+    # Open gripper before approach
     _ensure_gripper_open(driver, duration_ms=450)
-    time.sleep(0.3)
+    time.sleep(0.4)
 
-    # ── Step 2: Visual-servo refinement FROM HOME (camera has full view) ──────
-    # Run pixel-space VS while the arm is still at the scan position.
-    # The camera can clearly see the tomato here.  VS nudges arm-frame lateral
-    # (Y) and vertical (Z) until the detection centres in frame, then we
-    # re-solve IK once for the precise cut approach.
-    if VS_ENABLED and detector is not None and cap is not None:
-        logger.info(f"[{index+1}/{total}] VS pre-approach refinement (arm at home)...")
-        cut_target_m, q_vs = _visual_servo_refine(
-            arm, driver, detector, cap, cut_target_m, q_current, index, total
-        )
-        # After VS the arm may have made small lateral/vertical moves; update
-        # q_current so IK seeds from the correct pose.
-        q_current = q_vs.copy()
-        arm.set_joint_angles(q_current)
-
-        # Recompute cut target from the (possibly drifted) center estimate.
-        # Re-detect once to get a fresh center measurement.
-        _drain_camera_frames(cap, count=2)
-        ret_f, frame_f = cap.read()
-        if ret_f and frame_f is not None:
-            dets_f = detector.detect(frame_f, use_tracker=False)
-            if dets_f:
-                best_f = min(dets_f, key=lambda d: float(
-                    np.hypot(d["center_px"][0] - 320.0, d["center_px"][1] - 240.0)))
-                fresh_xyz = best_f["xyz_cm"]
-                fresh_center_m = camera_to_arm_frame(fresh_xyz)
-                if not EXACT_CENTER_TARGET:
-                    fresh_center_m, _ = _project_to_reachable(fresh_center_m, arm)
-                fresh_cut, fresh_proj = _stem_cut_point_from_center(fresh_center_m, arm)
-                if not (EXACT_CENTER_TARGET and fresh_proj):
-                    shift = float(np.linalg.norm(fresh_cut - np.array(cut_target_m)))
-                    logger.info(
-                        f"[{index+1}/{total}] Post-VS fresh measurement: "
-                        f"xyz_cm=({fresh_xyz['x']:.1f},{fresh_xyz['y']:.1f},{fresh_xyz['z']:.1f}) "
-                        f"cut_shift={shift*1000:.1f}mm"
-                    )
-                    cut_target_m = fresh_cut
-
-    # ── Step 3: Solve IK for the (VS-refined) cut target ─────────────────────
+    # Solve Jacobian-DLS on stem cut target (1cm offset by default).
     accepted, solved, err, iters, q_cut, used_target = _solve_ik_with_fallback(
         arm, q_current, cut_target_m
     )
     logger.info(
-        f"[{index+1}/{total}] Stem IK: solved={solved}, err={err*1000.0:.1f}mm, "
-        f"iters={iters}, accepted={accepted}"
+        f"[{index+1}/{total}] Stem solve: solved={solved}, err={err:.4f}m, iters={iters}, "
+        f"accepted={accepted}"
     )
 
     if not accepted:
-        logger.warning(f"[{index+1}/{total}] Stem IK failed — skipping tomato")
+        logger.warning(f"[{index+1}/{total}] Stem solve failed — skipping")
         arm.set_joint_angles(q_current)
         return False
 
-    # Verify FK(q_cut) ≈ cut_target_m (catches FK/IK model mismatch early)
-    fk_check = arm.end_effector_pos(q_cut)
-    fk_err = float(np.linalg.norm(fk_check - np.array(cut_target_m)))
-    logger.info(
-        f"[{index+1}/{total}] FK check: EE={fk_check.tolist()}, "
-        f"target={list(np.round(cut_target_m, 4))}, err={fk_err*1000.0:.1f}mm"
-    )
+    if np.linalg.norm(np.array(used_target) - np.array(target_m)) > 1e-6:
+        logger.warning(
+            f"[{index+1}/{total}] Using fallback motion target: "
+            f"[{used_target[0]:.3f}, {used_target[1]:.3f}, {used_target[2]:.3f}]m"
+        )
 
-    # ── Step 4: Single smooth approach to cut point ───────────────────────────
-    logger.info(
-        f"[{index+1}/{total}] Approaching cut point "
-        f"[{cut_target_m[0]:.3f},{cut_target_m[1]:.3f},{cut_target_m[2]:.3f}]m ..."
-    )
+    # Move: current position → cut point
+    logger.info(f"[{index+1}/{total}] Approaching tomato center...")
     if DRY_RUN:
         _log_dry_run(f"[{index+1}/{total}] Moving to cut point")
     execute_trajectory(arm, driver, q_current, q_cut,
                        steps=TRAJ_STEPS_APPROACH, duration_ms=MOVE_DURATION_MS)
 
-    # Brief settle at cut position
-    time.sleep(0.25)
+    # Jacobian iterative correction from moved pose to stem cut target.
+    corr_target = np.array(cut_target_m, dtype=float)
+    converged, q_corr, corr_err, corr_iters = _iterative_jacobian_correction(
+        arm, driver, corr_target, q_cut, index, total
+    )
+    q_cut = q_corr
+    logger.info(
+        f"[{index+1}/{total}] Jacobian correction: converged={converged}, "
+        f"final_err={corr_err:.4f}m, iters={corr_iters}"
+    )
+    if not converged:
+        logger.warning(
+            f"[{index+1}/{total}] Jacobian correction residual={corr_err*1000.0:.1f}mm — "
+            "proceeding with cut at best-effort position"
+        )
+
+    # Settling delay
+    time.sleep(0.3)
+
+    # Visual relock: re-detect center after approach and correct if drifted.
+    if detector is not None and cap is not None and CENTER_RELOCK_ENABLED:
+        for relock_iter in range(1, max(1, CENTER_RELOCK_MAX_ITERS) + 1):
+            relock_xyz_cm, relock_hits = _refine_target_xyz(
+                detector,
+                cap,
+                tomato_xyz_cm,
+                window_s=CENTER_RELOCK_S,
+            )
+            if relock_hits < CENTER_RELOCK_MIN_HITS:
+                msg = (
+                    f"[{index+1}/{total}] Re-lock {relock_iter}: insufficient re-detection hits "
+                    f"({relock_hits} < {CENTER_RELOCK_MIN_HITS})"
+                )
+                if EXACT_CENTER_TARGET:
+                    logger.warning(msg + " — aborting cut in exact mode")
+                    arm.set_joint_angles(q_current)
+                    return False
+                logger.info(msg + " — keeping current center target")
+                break
+
+            relock_center_m = camera_to_arm_frame(relock_xyz_cm)
+            relock_target_m, relock_projected = _stem_cut_point_from_center(relock_center_m, arm)
+            center_shift_m = float(np.linalg.norm(relock_target_m - corr_target))
+            logger.info(
+                f"[{index+1}/{total}] Re-lock {relock_iter}: stem-target shift={center_shift_m*1000.0:.1f}mm"
+            )
+            if center_shift_m <= CENTER_RELOCK_THRESH_M:
+                break
+
+            if EXACT_CENTER_TARGET and (relock_projected or (not arm.is_reachable(relock_target_m))):
+                logger.warning(
+                    f"[{index+1}/{total}] Re-lock target outside reach in exact mode; "
+                    "skipping cut to avoid wrong position"
+                )
+                arm.set_joint_angles(q_current)
+                return False
+
+            q_now = arm.joint_angles.copy()
+            accepted2, solved2, err2, iters2, q_relock, _ = _solve_ik_with_fallback(
+                arm, q_now, relock_target_m
+            )
+            logger.info(
+                f"[{index+1}/{total}] Re-lock solve: solved={solved2}, err={err2:.4f}m, "
+                f"iters={iters2}, accepted={accepted2}"
+            )
+            if not accepted2:
+                logger.warning(
+                    f"[{index+1}/{total}] Re-lock center solve failed; "
+                    "skipping cut to avoid wrong position"
+                )
+                arm.set_joint_angles(q_current)
+                return False
+
+            execute_trajectory(
+                arm,
+                driver,
+                q_now,
+                q_relock,
+                steps=max(10, TRAJ_STEPS_APPROACH // 2),
+                duration_ms=max(900, MOVE_DURATION_MS // 2),
+            )
+            converged2, q_corr2, corr_err2, corr_iters2 = _iterative_jacobian_correction(
+                arm,
+                driver,
+                relock_target_m,
+                q_relock,
+                index,
+                total,
+            )
+            logger.info(
+                f"[{index+1}/{total}] Re-lock Jacobian: converged={converged2}, "
+                f"final_err={corr_err2:.4f}m, iters={corr_iters2}"
+            )
+            if not converged2:
+                logger.warning(
+                    f"[{index+1}/{total}] Re-lock Jacobian residual={corr_err2*1000.0:.1f}mm — "
+                    "proceeding with cut at best-effort position"
+                )
+
+            q_cut = q_corr2
+            corr_target = relock_target_m
+            tomato_xyz_cm = relock_xyz_cm
+            time.sleep(0.2)
 
     # Close gripper / scissors to cut the stem
     logger.info(f"[{index+1}/{total}] {'[SKIPPED-DRY-RUN/NO-CUT]' if DRY_RUN or NO_CUT else 'CUTTING'} stem...")
@@ -847,6 +727,7 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total, detector=Non
         _perform_fast_cut(driver, index=index, total=total)
         logger.info(f"[{index+1}/{total}] Cut complete!")
         time.sleep(0.3)
+        _run_post_cut_actions(driver, index, total)
     else:
         if DRY_RUN:
             _log_dry_run(f"[{index+1}/{total}] Closing gripper ({CUT_GRIPPER_CLOSE_MS}ms)")
@@ -1558,7 +1439,7 @@ def run_harvesting(sim_mode=False):
                                    steps=TRAJ_STEPS_RETRACT,
                                    duration_ms=RETRACT_DURATION_MS)
                 arm.set_joint_angles(home_angles)
-                driver.move_servos(home_pulses, duration_ms=6000)
+                driver.move_servos(home_pulses, duration_ms=3000)
             else:
                 _log_dry_run("Returning arm to home base")
             time.sleep(RETRACT_DELAY_S)
@@ -1585,7 +1466,7 @@ def run_harvesting(sim_mode=False):
         logger.info("Parking arm (safe shutdown)...")
         if not DRY_RUN:
             _ensure_gripper_open(driver, duration_ms=450)
-            driver.go_park(duration_ms=6000)
+            driver.go_park(duration_ms=3500)
             time.sleep(2.0)
         else:
             _log_dry_run("Parking arm")
@@ -1723,6 +1604,7 @@ def main():
                     if not (DRY_RUN or NO_CUT):
                         logger.info(f"[INFO] CUTTING stem of tomato #{i+1}...")
                         _perform_fast_cut(driver, index=i, total=len(tomatoes))
+                        _run_post_cut_actions(driver, i, len(tomatoes))
                     else:
                         if DRY_RUN:
                             _log_dry_run(f"[INFO] Tomato #{i+1}: Closing gripper ({CUT_GRIPPER_CLOSE_MS}ms)")
@@ -1755,7 +1637,7 @@ def main():
         
         if not DRY_RUN:
             _ensure_gripper_open(driver, duration_ms=450)
-            driver.go_park(duration_ms=6000)
+            driver.go_park(duration_ms=3500)
             time.sleep(2.0)
         else:
             _log_dry_run("Parking arm")
