@@ -434,7 +434,7 @@ class SimulationGUI:
                 # Convert to arm frame and update GUI fields
                 xyz = best["xyz_cm"]
                 from main import camera_to_arm_frame
-                arm_pos = camera_to_arm_frame(xyz)
+                arm_pos = camera_to_arm_frame(xyz, self.arm)
                 self.x_var.set(f"{arm_pos[0]:.3f}")
                 self.y_var.set(f"{arm_pos[1]:.3f}")
                 self.z_var.set(f"{arm_pos[2]:.3f}")

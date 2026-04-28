@@ -27,6 +27,7 @@ The arm must be at Search Home for the camera to see the workspace.
 import argparse
 import json
 import logging
+import math
 import sys
 import time
 import cv2
@@ -53,25 +54,62 @@ TOMATO_RADIUS_M    = 0.035   # average tomato radius in metres
 CAMERA_INDEX       = 0       # default camera
 
 # ── Camera-to-arm transform ───────────────────────────────────────────────────
-# Because our camera is Hand-in-Eye (mounted on the wrist), the detected
-# xyz_cm is in the camera frame.  At Search Home the camera has a known
-# pose relative to the arm base.  This offset transforms camera coords
-# into arm-base coords.  CALIBRATE THESE VALUES on the real robot.
+# The camera is Hand-in-Eye (mounted between the wrist and gripper).
+# During scanning the arm is at Search Home; we use the arm's own forward
+# kinematics to compute the exact camera origin in the arm-base frame so the
+# transform stays correct for any calibrated link lengths.
 #
-# Approximate offsets when arm is at Search Home position:
-#   Camera is ~0.25m in front of the base, ~0.20m above ground, angled down.
-CAMERA_OFFSET_M = np.array([0.15, 0.0, 0.18], dtype=float)
+# CAMERA_TILT_RAD — downward tilt of the camera from the arm's forward
+#   (link) axis, in radians.  Positive = camera nose tilts toward the floor.
+#   Measure or tune on the real robot; 0 = perfectly level (good first guess).
+#
+# CAMERA_MOUNT_AHEAD_M — how many metres the camera optical centre sits ahead
+#   of the wrist joint along the link axis.  Defaults to half the last link.
+CAMERA_TILT_RAD = 0.0       # radians — tune on real robot
+CAMERA_MOUNT_AHEAD_M = 0.035  # metres  — approx half the last link (0.070 m)
 
 
-def camera_to_arm_frame(xyz_cm_dict):
-    """Convert vision xyz_cm (camera frame) → arm base frame (metres)."""
+def camera_to_arm_frame(xyz_cm_dict, arm):
+    """
+    Convert a camera-frame detection (x, y, z in cm) to arm-base frame (metres).
+
+    Coordinate conventions
+    ----------------------
+    Camera frame  : X = right,   Y = down,    Z = forward (into scene)
+    Arm base frame: X = forward, Y = left,     Z = up
+
+    The camera origin in arm-base frame is computed from the arm's FK at
+    Search Home, then shifted forward by CAMERA_MOUNT_AHEAD_M along the
+    end-effector link axis to place it at the camera optical centre.
+
+    A small pitch correction (CAMERA_TILT_RAD) rotates the depth-to-X and
+    height-to-Z mappings so the transform stays accurate even when the camera
+    is tilted slightly downward to view the workspace.
+    """
     cam = np.array([xyz_cm_dict["x"], xyz_cm_dict["y"], xyz_cm_dict["z"]],
                    dtype=float) / 100.0
-    # In hand-in-eye at Search Home: camera Z ≈ arm X (forward),
-    # camera X ≈ arm -Y, camera Y ≈ arm -Z
-    arm_x = cam[2] + CAMERA_OFFSET_M[0]   # depth → forward
-    arm_y = -cam[0] + CAMERA_OFFSET_M[1]  # left/right
-    arm_z = -cam[1] + CAMERA_OFFSET_M[2]  # up/down
+
+    # ── Step 1: camera origin from FK at Search Home ──────────────────────────
+    home_q = search_home_angles()
+    positions, rotations = arm.forward_kinematics(home_q)
+    R_ee = rotations[-1]                          # end-effector rotation (arm frame)
+    ee_pos = np.array(positions[-1], dtype=float) # end-effector position (arm frame)
+
+    # Move back from the gripper tip toward the wrist by (last link – mount ahead)
+    last_link = arm.link_lengths[-1]
+    cam_origin = ee_pos + R_ee.dot(
+        [CAMERA_MOUNT_AHEAD_M - last_link, 0.0, 0.0]
+    )
+
+    # ── Step 2: axis permutation + tilt correction ────────────────────────────
+    # Base mapping (zero tilt):  cam_Z → arm_X,  -cam_X → arm_Y,  -cam_Y → arm_Z
+    # With a downward camera tilt θ, cam_Z and cam_Y are mixed in the X/Z plane:
+    ct = math.cos(CAMERA_TILT_RAD)
+    st = math.sin(CAMERA_TILT_RAD)
+    arm_x = cam[2] * ct + cam[1] * st + cam_origin[0]   # depth  (+tilt)
+    arm_y = -cam[0]            + cam_origin[1]            # lateral (unchanged)
+    arm_z = -cam[1] * ct + cam[2] * st + cam_origin[2]   # vertical (+tilt)
+
     return np.array([arm_x, arm_y, arm_z], dtype=float)
 
 
@@ -142,15 +180,15 @@ def run_harvesting(sim_mode=False):
                     # Check if we have enough consistent detections
                     if (len(confirm_buffer) >= CONFIRM_FRAMES and
                             now - confirm_buffer[0][0] >= CONFIRM_SECONDS):
-                        # Average the confirmed position
+                        # Median position across confirmed frames (robust to outliers)
                         positions = [d["xyz_cm"] for _, d in confirm_buffer]
-                        avg_x = np.mean([p["x"] for p in positions])
-                        avg_y = np.mean([p["y"] for p in positions])
-                        avg_z = np.mean([p["z"] for p in positions])
-                        locked_xyz_cm = {"x": avg_x, "y": avg_y, "z": avg_z}
+                        med_x = float(np.median([p["x"] for p in positions]))
+                        med_y = float(np.median([p["y"] for p in positions]))
+                        med_z = float(np.median([p["z"] for p in positions]))
+                        locked_xyz_cm = {"x": med_x, "y": med_y, "z": med_z}
 
                         logger.info(f"LOCKED tomato at (cm): "
-                                    f"X={avg_x:.1f} Y={avg_y:.1f} Z={avg_z:.1f}")
+                                    f"X={med_x:.1f} Y={med_y:.1f} Z={med_z:.1f}")
 
                         state = "ACTING"
                         confirm_buffer.clear()
@@ -201,8 +239,8 @@ def run_harvesting(sim_mode=False):
 
 def _execute_harvest(arm, driver, locked_xyz_cm, frame):
     """Execute the full harvest: IK solve → move → cut → open gripper."""
-    # Convert camera-frame coords to arm-base frame
-    target_m = camera_to_arm_frame(locked_xyz_cm)
+    # Convert camera-frame coords to arm-base frame (uses FK-computed camera pose)
+    target_m = camera_to_arm_frame(locked_xyz_cm, arm)
     logger.info(f"Arm-frame target (m): {target_m}")
 
     # Check reachability
@@ -221,10 +259,20 @@ def _execute_harvest(arm, driver, locked_xyz_cm, frame):
     driver.gripper_open(duration_ms=400)
     time.sleep(0.5)
 
+    # Initialise joint angles toward the target before running IK —
+    # this prevents the DLS solver from getting trapped in a poor local
+    # minimum when the target is to the side or in a corner.
+    arm.initialise_for_target(cut_pt)
+
     # Solve IK for the cut point
     solved, err, iters = arm.inverse_kinematics(cut_pt, max_iters=400, tol=5e-4)
     q_cut = arm.joint_angles.copy()
     logger.info(f"IK solved={solved}, error={err:.4f}m, iters={iters}")
+
+    # FK sanity check: verify the end-effector will actually reach the cut point
+    fk_pos = arm.end_effector_pos(q_cut)
+    fk_err = float(np.linalg.norm(fk_pos - cut_pt))
+    logger.info(f"FK validation error: {fk_err:.4f}m")
 
     if not solved and err > 0.02:
         logger.warning(f"IK error too large ({err:.4f}m) — aborting harvest.")
