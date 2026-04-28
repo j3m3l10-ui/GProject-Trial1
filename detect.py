@@ -19,6 +19,7 @@ Coordinate frame:
 
 import cv2
 import json
+import math
 import os
 import numpy as np
 from ultralytics import YOLO
@@ -35,6 +36,9 @@ model = YOLO(MODEL_PATH)
 # ── Camera / optics ────────────────────────────────────────────────────────────
 FOCAL_LENGTH_PX  = 700    # pixels — run calibration with a known object to tune
 REAL_DIAMETER_CM = 7.0    # average ripe-tomato diameter (cm)
+
+# Minimum pixels from the frame edge before a bbox is considered clipped
+EDGE_MARGIN_PX   = 5
 
 # ── Detection twin-filters ─────────────────────────────────────────────────────
 # Raise this if you still see false positives; lower it only if real tomatoes
@@ -63,8 +67,16 @@ MIN_RED_PIXEL_RATIO = 0.18
 
 # ── Helper functions ───────────────────────────────────────────────────────────
 
-def estimate_depth_cm(pixel_diameter: float) -> float | None:
-    """Pinhole-model depth estimate: Z = (real_size * f) / pixel_size."""
+def estimate_depth_cm(pixel_width: float, pixel_height: float | None = None) -> float | None:
+    """
+    Pinhole-model depth estimate: Z = (real_size * f) / pixel_size.
+    Uses the geometric mean of bbox width and height for a more robust
+    depth estimate, especially for off-centre or partially occluded bboxes.
+    """
+    if pixel_height is not None and pixel_height > 0:
+        pixel_diameter = math.sqrt(float(pixel_width) * float(pixel_height))
+    else:
+        pixel_diameter = float(pixel_width)
     if pixel_diameter <= 0:
         return None
     return (REAL_DIAMETER_CM * FOCAL_LENGTH_PX) / pixel_diameter
@@ -138,7 +150,14 @@ try:
             if not passes_size_and_shape(x1, y1, x2, y2):
                 continue
 
-            # ── Filter 2: colour must be red/orange ───────────────────────────
+            # ── Filter 2: skip bboxes clipped by the frame edge ───────────────
+            # A clipped bbox gives a wrong centre and an unreliable depth.
+            if (x1 < EDGE_MARGIN_PX or y1 < EDGE_MARGIN_PX or
+                    x2 > frame_w - EDGE_MARGIN_PX or
+                    y2 > frame_h - EDGE_MARGIN_PX):
+                continue
+
+            # ── Filter 3: colour must be red/orange ───────────────────────────
             roi = frame[max(0, y1):min(frame_h, y2),
                         max(0, x1):min(frame_w, x2)]
             if not passes_colour_gate(roi):
@@ -146,7 +165,8 @@ try:
 
             # ── All filters passed — compute 3-D position ─────────────────────
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            z_cm   = estimate_depth_cm(x2 - x1)
+            # Geometric mean of width and height for a more accurate depth estimate
+            z_cm   = estimate_depth_cm(x2 - x1, y2 - y1)
             if z_cm is None:
                 continue
 

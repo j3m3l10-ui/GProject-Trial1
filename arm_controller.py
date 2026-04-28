@@ -129,7 +129,49 @@ class FiveDOFArm:
         return J
 
     # ── Damped Least-Squares IK ────────────────────────────────────────────────
-    def inverse_kinematics(self, target, max_iters=300, tol=5e-4, lam=1e-2):
+    # Named constants for the IK algorithm to aid tuning and readability
+    _IK_INIT_ELBOW_BEND      = 0.3   # radians — moderate initial elbow bend
+    _IK_DAMPING_ERR_SCALE    = 0.05  # metres  — error level at which damping = lam
+    _IK_MAX_STEP_RAD         = 0.2   # radians — per-iteration step clamp
+
+    def initialise_for_target(self, target):
+        """
+        Set a good initial joint configuration before running IK.
+
+        Aligns the base yaw toward the horizontal direction of the target and
+        sets a moderate shoulder/elbow configuration so the DLS solver starts
+        from a configuration that is already pointing roughly at the target.
+        This is critical for left/right/corner targets where starting from the
+        Search Home angles can trap the solver in a poor local minimum.
+        """
+        target = np.array(target, dtype=float)
+        q = self.joint_angles.copy()
+
+        # Base yaw: point directly at the target in the XY plane
+        q[0] = math.atan2(target[1], target[0])
+
+        # Shoulder: half the geometric pitch toward target height — halved to
+        # avoid over-pitching on the initial estimate before IK refinement.
+        dist_xy = math.sqrt(target[0] ** 2 + target[1] ** 2)
+        q[1] = np.clip(-math.atan2(target[2], max(dist_xy, 1e-6)) * 0.5,
+                       self.joint_limits[1, 0], self.joint_limits[1, 1])
+
+        # Elbow: moderate forward bend (initial estimate, refined by IK)
+        q[2] = np.clip(self._IK_INIT_ELBOW_BEND,
+                       self.joint_limits[2, 0], self.joint_limits[2, 1])
+
+        # Wrist: level
+        q[3] = 0.0
+        q[4] = 0.0
+        self.set_joint_angles(q)
+
+    def inverse_kinematics(self, target, max_iters=400, tol=5e-4, lam=5e-3):
+        """
+        Damped Least-Squares (DLS) inverse kinematics with adaptive damping.
+
+        Adaptive damping reduces λ as the error decreases so the solver is
+        stable when far from the target and precise when close to it.
+        """
         target = np.array(target, dtype=float)
         q = self.joint_angles.copy()
         for it in range(max_iters):
@@ -138,9 +180,20 @@ class FiveDOFArm:
             if err_norm < tol:
                 self.set_joint_angles(q)
                 return True, err_norm, it
+
+            # Adaptive damping: scale λ up when error is large (stability),
+            # scale it down when error is small (precision).
+            lam_adaptive = lam * max(err_norm / self._IK_DAMPING_ERR_SCALE, 1.0)
+
             J = self.jacobian(q)
-            A = J @ J.T + (lam ** 2) * np.eye(3)
+            A = J @ J.T + (lam_adaptive ** 2) * np.eye(3)
             dq = J.T @ np.linalg.solve(A, err_vec)
+
+            # Clamp the step to avoid overshooting
+            step_norm = np.linalg.norm(dq)
+            if step_norm > self._IK_MAX_STEP_RAD:
+                dq = dq * (self._IK_MAX_STEP_RAD / step_norm)
+
             q += dq
             for i in range(len(q)):
                 q[i] = np.clip(q[i], self.joint_limits[i, 0],

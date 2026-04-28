@@ -6,6 +6,7 @@ main.py and the simulation GUI without opening a camera or running a loop.
 """
 
 import cv2
+import math
 import os
 import numpy as np
 from ultralytics import YOLO
@@ -43,6 +44,7 @@ class TomatoDetector:
         self.min_aspect = 0.45
         self.max_aspect = 2.20
         self.min_red_ratio = 0.18
+        self.edge_margin_px = 5   # pixels — skip bboxes this close to frame edge
 
         # HSV red ranges
         self._lo1 = np.array([0,   80,  50], dtype=np.uint8)
@@ -51,7 +53,16 @@ class TomatoDetector:
         self._hi2 = np.array([179, 255, 255], dtype=np.uint8)
 
     # ── Depth estimation ───────────────────────────────────────────────────────
-    def estimate_depth_cm(self, pixel_diameter):
+    def estimate_depth_cm(self, pixel_width, pixel_height=None):
+        """
+        Estimate depth via the pinhole model.
+        Uses the geometric mean of width and height when both are given —
+        this is more robust than width alone for off-centre or skewed bboxes.
+        """
+        if pixel_height is not None and pixel_height > 0:
+            pixel_diameter = math.sqrt(float(pixel_width) * float(pixel_height))
+        else:
+            pixel_diameter = float(pixel_width)
         if pixel_diameter <= 0:
             return None
         return (self.real_diameter_cm * self.focal_length_px) / pixel_diameter
@@ -98,12 +109,19 @@ class TomatoDetector:
             if not self._passes_size_shape(x1, y1, x2, y2):
                 continue
 
+            # Skip detections whose bounding box touches the frame edge —
+            # a clipped bbox gives an unreliable centre and depth estimate.
+            m = self.edge_margin_px
+            if x1 < m or y1 < m or x2 > fw - m or y2 > fh - m:
+                continue
+
             roi = frame[max(0, y1):min(fh, y2), max(0, x1):min(fw, x2)]
             if not self._passes_colour(roi):
                 continue
 
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            z_cm = self.estimate_depth_cm(x2 - x1)
+            # Use geometric mean of width and height for more accurate depth
+            z_cm = self.estimate_depth_cm(x2 - x1, y2 - y1)
             if z_cm is None:
                 continue
 
