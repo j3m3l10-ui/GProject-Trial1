@@ -12,7 +12,8 @@ Servo index → ID mapping (on the daisy chain):
   [4] → ID 1  (Gripper / Scissors)
 
 Bus servo pulse range: 0–1000 (centre 500).
-Hand-in-Eye camera mounted between wrist (ID3) and gripper (ID1).
+Hand-in-Eye camera mounted at the missing ID2 bracket between wrist (ID3)
+and gripper (ID1).
 """
 
 import math
