@@ -21,15 +21,13 @@ Servo control:  direct I2C via smbus2 to the PWM servo controller at
                 0x34 on bus 1.  No vendor-specific SDK required.
 
 Usage:
-    python main.py                  # real hardware (5-DOF arm + camera)
-    python main.py --sim            # simulation mode (no real servos)
+  python main.py                  # real hardware (5-DOF arm + camera)
+  python main.py --sim            # simulation mode (no real servos)
 
-Hand-in-Eye: camera is mounted at the missing ID2 bracket between wrist (ID3)
-and gripper (ID1).
+Hand-in-Eye: camera is mounted between wrist (ID3) and gripper (ID1).
 """
 
 import argparse
-import csv
 import json
 import logging
 import sqlite3
@@ -71,8 +69,14 @@ RETRACT_DURATION_MS  = 12000  # slow return to protect components
 GRIPPER_DELAY_S      = 0.6    # wait after gripper close (cutting)
 RETRACT_DELAY_S      = 1.0    # wait after returning home
 TOMATO_RADIUS_M      = 0.035  # average tomato radius in metres
-# Default target reference is 1 cm above the detected tomato center.
-STEM_VERTICAL_OFFSET_M = float(os.getenv("STEM_VERTICAL_OFFSET_M", "0.010"))
+# Default target reference is the detected center point (0cm Z offset).
+STEM_VERTICAL_OFFSET_M = float(os.getenv("STEM_VERTICAL_OFFSET_M", "0.000"))
+# Depth pullback to compensate for end-effector / gripper-tip protrusion past the
+# wrist. The detected camera depth places the WRIST at the tomato; subtracting
+# this offset along arm-frame X (camera depth axis) lands the gripper tip
+# exactly at the stem instead of overshooting. Override with env var.
+ARM_TOTAL_LENGTH_M     = float(os.getenv("ARM_TOTAL_LENGTH_M", "0.36"))
+STEM_DEPTH_OFFSET_M    = float(os.getenv("STEM_DEPTH_OFFSET_M", "0.030"))
 CUT_GRIPPER_CLOSE_MS = int(os.getenv("CUT_GRIPPER_CLOSE_MS", "200"))
 CAMERA_INDEX         = 0      # default camera index
 TRAJ_STEPS_APPROACH  = 50     # more interpolation points for smoother approach
@@ -113,94 +117,51 @@ PREMOVE_REFINE_MIN_HITS = int(os.getenv("PREMOVE_REFINE_MIN_HITS", "2"))
 CENTER_STABLE_PIXEL_THRESH = float(os.getenv("CENTER_STABLE_PIXEL_THRESH", "3.0"))
 CENTER_STABLE_FRAMES = int(os.getenv("CENTER_STABLE_FRAMES", "10"))
 CENTER_STABLE_WINDOW_S = float(os.getenv("CENTER_STABLE_WINDOW_S", "2.5"))
-CENTER_RELOCK_ENABLED = os.getenv("CENTER_RELOCK_ENABLED", "1").strip().lower() not in {
+CENTER_RELOCK_ENABLED = os.getenv("CENTER_RELOCK_ENABLED", "0").strip().lower() not in {
     "0", "false", "no"
 }
 CENTER_RELOCK_S = float(os.getenv("CENTER_RELOCK_S", "0.6"))
 CENTER_RELOCK_THRESH_M = float(os.getenv("CENTER_RELOCK_THRESH_M", "0.010"))
 CENTER_RELOCK_MAX_ITERS = int(os.getenv("CENTER_RELOCK_MAX_ITERS", "2"))
 CENTER_RELOCK_MIN_HITS = int(os.getenv("CENTER_RELOCK_MIN_HITS", str(PREMOVE_REFINE_MIN_HITS)))
-PIXEL_SERVO_ENABLED = os.getenv("PIXEL_SERVO_ENABLED", "1").strip().lower() not in {
-    "0", "false", "no"
-}
-PIXEL_SERVO_MAX_ITERS = int(os.getenv("PIXEL_SERVO_MAX_ITERS", "4"))
-PIXEL_SERVO_WINDOW_S = float(os.getenv("PIXEL_SERVO_WINDOW_S", "0.7"))
-PIXEL_SERVO_MIN_HITS = int(os.getenv("PIXEL_SERVO_MIN_HITS", "2"))
-PIXEL_SERVO_THRESH_X_PX = float(os.getenv("PIXEL_SERVO_THRESH_X_PX", "14.0"))
-PIXEL_SERVO_THRESH_Y_PX = float(os.getenv("PIXEL_SERVO_THRESH_Y_PX", "12.0"))
-PIXEL_SERVO_BASE_GAIN = float(os.getenv("PIXEL_SERVO_BASE_GAIN", "0.0010"))
-PIXEL_SERVO_SHOULDER_GAIN = float(os.getenv("PIXEL_SERVO_SHOULDER_GAIN", "0.0007"))
-PIXEL_SERVO_ELBOW_GAIN = float(os.getenv("PIXEL_SERVO_ELBOW_GAIN", "0.0003"))
-PIXEL_SERVO_WRIST_GAIN = float(os.getenv("PIXEL_SERVO_WRIST_GAIN", "-0.0005"))
-PIXEL_SERVO_BASE_SIGN = float(os.getenv("PIXEL_SERVO_BASE_SIGN", "-1.0"))
-PIXEL_SERVO_VERTICAL_SIGN = float(os.getenv("PIXEL_SERVO_VERTICAL_SIGN", "-1.0"))
-PIXEL_SERVO_MAX_STEP_RAD = float(os.getenv("PIXEL_SERVO_MAX_STEP_RAD", "0.06"))
-PIXEL_SERVO_MOVE_MS = int(os.getenv("PIXEL_SERVO_MOVE_MS", "900"))
-APPROACH_TRACKING_ENABLED = os.getenv("APPROACH_TRACKING_ENABLED", "1").strip().lower() not in {
-    "0", "false", "no"
-}
-APPROACH_TRACKING_CHUNKS = int(os.getenv("APPROACH_TRACKING_CHUNKS", "4"))
-APPROACH_TRACKING_REFINE_S = float(os.getenv("APPROACH_TRACKING_REFINE_S", "0.35"))
-APPROACH_TRACKING_STOP_ERR_M = float(os.getenv("APPROACH_TRACKING_STOP_ERR_M", "0.012"))
-EXACT_CENTER_TARGET = os.getenv("EXACT_CENTER_TARGET", "1").strip().lower() not in {
+# Closed-loop pixel-space visual-servo refinement (port of intelligent_grasp.py PID idea):
+# nudge arm-frame Y/Z until the tomato's pixel center sits inside the image-centre dead-zone
+# for VS_STABLE_FRAMES consecutive frames, then commit to the cut. Removes residual
+# focal-length / mounting bias that 1-shot 3D estimation cannot correct.
+VS_ENABLED = os.getenv("VS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+VS_PIXEL_TOL = float(os.getenv("VS_PIXEL_TOL", "8.0"))         # pixel dead-zone (per axis)
+VS_MAX_ITERS = int(os.getenv("VS_MAX_ITERS", "6"))
+VS_STABLE_FRAMES = int(os.getenv("VS_STABLE_FRAMES", "3"))
+VS_KP_LATERAL = float(os.getenv("VS_KP_LATERAL", "0.6"))      # gain on (px*depth/f)
+VS_KP_VERTICAL = float(os.getenv("VS_KP_VERTICAL", "0.6"))
+VS_MAX_STEP_M = float(os.getenv("VS_MAX_STEP_M", "0.020"))    # per-iter clamp (2cm)
+VS_STEP_DURATION_MS = int(os.getenv("VS_STEP_DURATION_MS", "900"))
+VS_FOCAL_PX_FALLBACK = float(os.getenv("VS_FOCAL_PX_FALLBACK", "700.0"))
+EXACT_CENTER_TARGET = os.getenv("EXACT_CENTER_TARGET", "0").strip().lower() not in {
     "0", "false", "no"
 }
 FOCAL_LENGTH_PX_ENV = os.getenv("FOCAL_LENGTH_PX", "").strip()
 FOCAL_LENGTH_PX = float(FOCAL_LENGTH_PX_ENV) if FOCAL_LENGTH_PX_ENV else None
 
 # ── Camera-to-arm transform ───────────────────────────────────────────────────
-# Hand-in-Eye / coarse home model: at Search Home the camera has a known pose
-# relative to the arm base. The camera is mounted at the missing ID2 bracket
-# between wrist (ID3) and gripper (ID1). When no precise calibration is loaded,
-# the fallback mapping uses that home-pose FK frame instead of a floating base
-# offset so the 3D target is anchored to the real mount location.
-# Camera mount frame reference for computing transform at home pose
-CAMERA_MOUNT_FRAME = os.getenv("CAMERA_MOUNT_FRAME", "wrist").strip().lower()  # Where is camera mounted (wrist=ID3 output)
-CAMERA_MOUNT_LOCAL_OFFSET_M = np.array([
-    float(os.getenv("CAMERA_MOUNT_OFFSET_X_M", "0.020")),  # Forward from wrist
-    float(os.getenv("CAMERA_MOUNT_OFFSET_Y_M", "0.000")),  # Lateral offset
-    float(os.getenv("CAMERA_MOUNT_OFFSET_Z_M", "0.010")),  # Vertical offset
-], dtype=float)
-
-# Legacy base offset (if using old calibration)
+# Hand-in-Eye: at Search Home the camera has a known pose relative to
+# the arm base.  CALIBRATE THESE VALUES on the real robot.
+# Arm reach is 41cm — camera is between wrist (ID3) and gripper (ID1),
+# roughly a few cm forward from base and above when at Search Home.
+# Defaults are intentionally conservative; tune via env vars below.
 CAMERA_OFFSET_M = np.array([
     float(os.getenv("CAMERA_OFFSET_X_M", "0.03")),
     float(os.getenv("CAMERA_OFFSET_Y_M", "0.00")),
     float(os.getenv("CAMERA_OFFSET_Z_M", "0.10")),
 ], dtype=float)
-CAMERA_OFFSET_ENV_SET = any(
-    key in os.environ
-    for key in ("CAMERA_OFFSET_X_M", "CAMERA_OFFSET_Y_M", "CAMERA_OFFSET_Z_M")
-)
-CAMERA_MOUNT_FRAME = os.getenv("CAMERA_MOUNT_FRAME", "id2").strip().lower()
-CAMERA_MOUNT_LOCAL_OFFSET_M = np.array([
-    float(os.getenv("CAMERA_MOUNT_OFFSET_X_M", "0.020")),
-    float(os.getenv("CAMERA_MOUNT_OFFSET_Y_M", "0.000")),
-    float(os.getenv("CAMERA_MOUNT_OFFSET_Z_M", "0.010")),
-], dtype=float)
-CAMERA_MOUNT_OFFSET_ENV_SET = any(
-    key in os.environ
-    for key in (
-        "CAMERA_MOUNT_OFFSET_X_M",
-        "CAMERA_MOUNT_OFFSET_Y_M",
-        "CAMERA_MOUNT_OFFSET_Z_M",
-    )
-)
-CAMERA_USE_LEGACY_BASE_OFFSET = os.getenv(
-    "CAMERA_USE_LEGACY_BASE_OFFSET",
-    "1" if CAMERA_OFFSET_ENV_SET and not CAMERA_MOUNT_OFFSET_ENV_SET else "0",
-).strip().lower() not in {"0", "false", "no"}
-# Camera coordinate system axis mapping to arm base frame
 CAMERA_AXIS_SCALE = np.array([
     float(os.getenv("CAMERA_SCALE_X", "1.0")),
     float(os.getenv("CAMERA_SCALE_Y", "1.0")),
     float(os.getenv("CAMERA_SCALE_Z", "1.0")),
 ], dtype=float)
-CAMERA_AXIS_MAP = {
-    'x': os.getenv("CAMERA_AXIS_MAP_X", "+x").strip().lower(),  # Which arm axis corresponds to camera X
-    'y': os.getenv("CAMERA_AXIS_MAP_Y", "+y").strip().lower(),  # Which arm axis corresponds to camera Y  
-    'z': os.getenv("CAMERA_AXIS_MAP_Z", "+z").strip().lower(),  # Which arm axis corresponds to camera Z
-}
+CAMERA_LATERAL_SIGN = float(os.getenv("CAMERA_LATERAL_SIGN", "-1.0"))
+CAMERA_LATERAL_GAIN = float(os.getenv("CAMERA_LATERAL_GAIN", "1.0"))
+CAMERA_VERTICAL_SIGN = float(os.getenv("CAMERA_VERTICAL_SIGN", "-1.0"))
 
 # Final target calibration in arm frame (post axis-map, pre-offset).
 # This affine matrix allows directional calibration without changing IK.
@@ -230,22 +191,6 @@ ARM_BIAS_FILE = os.getenv(
     "ARM_BIAS_FILE",
     os.path.join(os.path.dirname(__file__), "arm_bias_calibration.json"),
 )
-CAM_ARM_POINTS_FILE = os.getenv(
-    "CAM_ARM_POINTS_FILE",
-    os.path.join(os.path.dirname(__file__), "cam_arm_points.csv"),
-)
-CAMERA_MAPPING_MODE = os.getenv("CAMERA_MAPPING_MODE", "auto").strip().lower()
-ALLOW_COARSE_FALLBACK = os.getenv("ALLOW_COARSE_FALLBACK", "1").strip().lower() not in {
-    "0", "false", "no"
-}
-CAM_ARM_CALIB_MAX_RMS_M = float(os.getenv("CAM_ARM_CALIB_MAX_RMS_M", "0.03"))
-CAM_ARM_ENABLE_Z_COMP = os.getenv("CAM_ARM_ENABLE_Z_COMP", "1").strip().lower() not in {
-    "0", "false", "no"
-}
-COARSE_TARGET_Z_BIAS_M = float(os.getenv("COARSE_TARGET_Z_BIAS_M", "-0.020"))
-CAM_USE_IDENTITY_ROTATION = os.getenv("CAM_USE_IDENTITY_ROTATION", "0").strip().lower() not in {
-    "0", "false", "no"
-}
 
 
 def _load_arm_target_bias():
@@ -298,90 +243,6 @@ def _transform_from_rotation_translation(rotation_m, translation_v):
     return transform
 
 
-
-# If CAM_USE_IDENTITY_ROTATION=1, camera frame axes align with wrist frame
-# Otherwise, apply 90° Z-rotation (typical for wrist-mounted cameras)
-if CAM_USE_IDENTITY_ROTATION:
-    NOMINAL_CAMERA_TO_MOUNT_ROT = np.identity(3, dtype=float)
-else:
-    NOMINAL_CAMERA_TO_MOUNT_ROT = np.array([
-        [0.0, -1.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ], dtype=float)
-
-def _resolve_home_camera_mount_index(frame_name):
-    """Map frame name to FK position index. Camera at ID2 bracket is wrist output (index 4)."""
-    frame = (frame_name or "").strip().lower()
-    frame_map = {
-        "base": 0,        # Base frame
-        "id6": 1,         # After base (shoulder mount)
-        "shoulder": 1,
-        "id5": 1,
-        "upper_arm": 2,   # After shoulder (elbow mount)
-        "elbow": 3,       # After elbow (wrist pitch mount)  
-        "id4": 3,
-        "wrist": 4,       # After wrist pitch (ID2 bracket - CAMERA HERE)
-        "id3": 4,         # ID3 wrist output = camera mount
-        "id2": 4,         # ID2 bracket is at this position
-        "camera": 4,      # Camera mounted at wrist bracket
-        "camera_mount": 4,
-        "tool": 5,        # Gripper mount (after gripper roll)
-        "gripper": 5,
-        "id1": 5,
-    }
-    if frame not in frame_map:
-        logger.warning(
-            f"Unknown CAMERA_MOUNT_FRAME={frame_name!r}; defaulting to wrist (index 4)"
-        )
-    return frame_map.get(frame, 4)
-
-
-def _coarse_camera_pose_at_home():
-    """
-    Compute the camera pose (position & rotation) in arm base frame at search home.
-    Camera is physically mounted at the ID2 bracket (wrist output, after ID3).
-    Returns (rotation_matrix_3x3, position_vector_3, mode_string).
-    """
-    if CAMERA_USE_LEGACY_BASE_OFFSET:
-        logger.info("Using legacy base-offset camera model (not FK-anchored)")
-        return (
-            CAM_TO_ARM_FINE_ROT @ NOMINAL_CAMERA_TO_MOUNT_ROT,
-            CAMERA_OFFSET_M.copy(),
-            "legacy-base-offset",
-        )
-
-    # Compute camera pose from FK at home
-    arm = FiveDOFArm()
-    home_angles = get_home_angles()
-    arm.set_joint_angles(home_angles)
-    positions, rotations = arm.forward_kinematics(home_angles)
-    
-    # Camera mount is at wrist output (index 4 in FK positions array)
-    ref_idx = _resolve_home_camera_mount_index(CAMERA_MOUNT_FRAME)
-    mount_pos = np.array(positions[ref_idx], dtype=float)
-    mount_rot = np.array(rotations[ref_idx], dtype=float)
-    
-    logger.info(
-        f"FK camera mount: frame_idx={ref_idx}, mount_pos={mount_pos}, "
-        f"local_offset={CAMERA_MOUNT_LOCAL_OFFSET_M}"
-    )
-    
-    # Camera origin in arm base frame: mount position + local offset in mount frame
-    camera_origin = mount_pos + mount_rot @ CAMERA_MOUNT_LOCAL_OFFSET_M
-    
-    # Camera rotation: mount rotation combined with camera's local rotation
-    # The camera points forward along the arm's local +X axis at home
-    camera_rot = mount_rot @ CAM_TO_ARM_FINE_ROT @ NOMINAL_CAMERA_TO_MOUNT_ROT
-    
-    logger.info(
-        f"Coarse camera pose at home: origin={camera_origin}, "
-        f"mode=fk-anchored-{CAMERA_MOUNT_FRAME}"
-    )
-    
-    return camera_rot, camera_origin, f"fk-anchored-{CAMERA_MOUNT_FRAME}"
-
-
 def _load_hand_eye_camera_to_arm_transform():
     if not os.path.isfile(HAND_EYE_FILE):
         return None
@@ -405,14 +266,10 @@ def _load_hand_eye_camera_to_arm_transform():
         arm = FiveDOFArm()
         arm.set_joint_angles(get_home_angles())
         positions, rotations = arm.forward_kinematics(arm.joint_angles)
-        # Camera is mounted at the missing ID2 bracket between wrist and
-        # gripper. Using the final tool-tip frame introduces a near-constant
-        # directional offset (~link_lengths[4]). Default to the ID2/wrist frame
-        # for hand-eye composition.
-        ref_name = HAND_EYE_REFERENCE_FRAME
-        ref_idx = _resolve_home_camera_mount_index(ref_name)
-        if ref_name == "tool":
-            ref_idx = -1
+        # Camera is mounted between wrist and gripper. Using the final tool-tip
+        # frame introduces a near-constant directional offset (~link_lengths[4]).
+        # Default to wrist/gripper-base frame for hand-eye composition.
+        ref_idx = -2 if HAND_EYE_REFERENCE_FRAME != "tool" else -1
         base_to_gripper = _transform_from_rotation_translation(
             rotations[ref_idx],
             positions[ref_idx],
@@ -426,212 +283,7 @@ def _load_hand_eye_camera_to_arm_transform():
         return None
 
 
-def _load_cam_arm_affine_from_csv():
-    """Load affine camera->arm calibration from sampled points CSV."""
-    if not os.path.isfile(CAM_ARM_POINTS_FILE):
-        return None
-
-    rows = []
-    try:
-        with open(CAM_ARM_POINTS_FILE, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    cam = np.array([
-                        float(row["cam_x_cm"]),
-                        float(row["cam_y_cm"]),
-                        float(row["cam_z_cm"]),
-                    ], dtype=float) / 100.0
-                    arm = np.array([
-                        float(row["arm_x_m"]),
-                        float(row["arm_y_m"]),
-                        float(row["arm_z_m"]),
-                    ], dtype=float)
-                    rows.append((cam, arm))
-                except (KeyError, ValueError, TypeError):
-                    continue
-    except Exception as exc:
-        logger.warning(
-            f"Failed to load camera-arm calibration CSV {CAM_ARM_POINTS_FILE}: {exc}"
-        )
-        return None
-
-    if len(rows) < 4:
-        logger.warning(
-            f"Camera-arm calibration needs >=4 points, found {len(rows)} in {CAM_ARM_POINTS_FILE}"
-        )
-        return None
-
-    cam_pts = np.array([c for c, _ in rows], dtype=float)
-    arm_pts = np.array([a for _, a in rows], dtype=float)
-    cam_h = np.hstack([cam_pts, np.ones((cam_pts.shape[0], 1), dtype=float)])
-    coeffs, *_ = np.linalg.lstsq(cam_h, arm_pts, rcond=None)
-    pred = cam_h @ coeffs
-    rms = float(np.sqrt(np.mean(np.sum((pred - arm_pts) ** 2, axis=1))))
-    if rms > CAM_ARM_CALIB_MAX_RMS_M:
-        logger.warning(
-            f"Camera-arm affine calibration RMS {rms:.4f}m exceeds threshold "
-            f"{CAM_ARM_CALIB_MAX_RMS_M:.4f}m; ignoring this calibration"
-        )
-        return None
-
-    transform = np.eye(4, dtype=float)
-    transform[:3, :4] = coeffs.T
-    logger.info(
-        f"Loaded camera-arm affine calibration from {CAM_ARM_POINTS_FILE} "
-        f"with {len(rows)} points, RMS={rms*100.0:.2f}cm"
-    )
-    return transform
-
-
-def _fit_umeyama_similarity(src_pts, dst_pts, estimate_scale=False):
-    """Solve dst ≈ s * R * src + t using Umeyama least-squares alignment."""
-    src = np.asarray(src_pts, dtype=float)
-    dst = np.asarray(dst_pts, dtype=float)
-    n = src.shape[0]
-    src_mean = np.mean(src, axis=0)
-    dst_mean = np.mean(dst, axis=0)
-    src_c = src - src_mean
-    dst_c = dst - dst_mean
-    cov = (dst_c.T @ src_c) / float(n)
-    U, D, Vt = np.linalg.svd(cov)
-    S = np.eye(3, dtype=float)
-    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
-        S[-1, -1] = -1.0
-    R = U @ S @ Vt
-    if estimate_scale:
-        src_var = float(np.mean(np.sum(src_c * src_c, axis=1)))
-        scale = float(np.trace(np.diag(D) @ S) / max(src_var, 1e-12))
-    else:
-        scale = 1.0
-    t = dst_mean - scale * (R @ src_mean)
-    return R, t, scale
-
-
-def _load_cam_arm_rigid_from_csv():
-    """Load rigid camera->arm calibration with optional Z compensation."""
-    if not os.path.isfile(CAM_ARM_POINTS_FILE):
-        return None
-
-    rows = []
-    try:
-        with open(CAM_ARM_POINTS_FILE, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    cam = np.array([
-                        float(row["cam_x_cm"]),
-                        float(row["cam_y_cm"]),
-                        float(row["cam_z_cm"]),
-                    ], dtype=float) / 100.0
-                    arm = np.array([
-                        float(row["arm_x_m"]),
-                        float(row["arm_y_m"]),
-                        float(row["arm_z_m"]),
-                    ], dtype=float)
-                    rows.append((cam, arm))
-                except (KeyError, ValueError, TypeError):
-                    continue
-    except Exception as exc:
-        logger.warning(
-            f"Failed to load camera-arm calibration CSV {CAM_ARM_POINTS_FILE}: {exc}"
-        )
-        return None
-
-    if len(rows) < 4:
-        return None
-
-    cam_pts = np.array([c for c, _ in rows], dtype=float)
-    arm_pts = np.array([a for _, a in rows], dtype=float)
-    R, t, s = _fit_umeyama_similarity(cam_pts, arm_pts, estimate_scale=False)
-    pred = (s * (R @ cam_pts.T)).T + t
-    residual = pred - arm_pts
-    rms = float(np.sqrt(np.mean(np.sum(residual ** 2, axis=1))))
-
-    z_comp = np.array([0.0, 0.0], dtype=float)
-    if CAM_ARM_ENABLE_Z_COMP:
-        z_design = np.column_stack([cam_pts[:, 2], np.ones(cam_pts.shape[0], dtype=float)])
-        z_comp, *_ = np.linalg.lstsq(z_design, arm_pts[:, 2] - pred[:, 2], rcond=None)
-        pred_z = pred.copy()
-        pred_z[:, 2] += z_design @ z_comp
-        residual_z = pred_z - arm_pts
-        rms_z = float(np.sqrt(np.mean(np.sum(residual_z ** 2, axis=1))))
-        if rms_z <= rms:
-            pred = pred_z
-            residual = residual_z
-            rms = rms_z
-        else:
-            z_comp = np.array([0.0, 0.0], dtype=float)
-
-    if rms > CAM_ARM_CALIB_MAX_RMS_M:
-        logger.warning(
-            f"Camera-arm rigid calibration RMS {rms:.4f}m exceeds threshold "
-            f"{CAM_ARM_CALIB_MAX_RMS_M:.4f}m; ignoring this calibration"
-        )
-        return None
-
-    logger.info(
-        f"Loaded camera-arm rigid calibration from {CAM_ARM_POINTS_FILE} with "
-        f"{len(rows)} points, RMS={rms*100.0:.2f}cm, "
-        f"z_comp={'on' if np.linalg.norm(z_comp) > 1e-12 else 'off'}"
-    )
-    return {"R": R, "t": t, "s": float(s), "z_comp": z_comp}
-
-
 HAND_EYE_CAMERA_TO_ARM_T = _load_hand_eye_camera_to_arm_transform()
-CAM_ARM_RIGID_CAL = _load_cam_arm_rigid_from_csv()
-CAM_ARM_AFFINE_T = _load_cam_arm_affine_from_csv()
-COARSE_CAMERA_TO_ARM_ROT, COARSE_CAMERA_ORIGIN_M, COARSE_CAMERA_POSE_MODE = _coarse_camera_pose_at_home()
-
-
-def _resolve_mapping_mode():
-    mode = CAMERA_MAPPING_MODE
-    valid = {"auto", "hand_eye", "calibrated_rigid", "calibrated_affine", "coarse"}
-    if mode not in valid:
-        logger.warning(
-            f"Unknown CAMERA_MAPPING_MODE={CAMERA_MAPPING_MODE}; defaulting to auto"
-        )
-        mode = "auto"
-    return mode
-
-
-def _validate_mapping_configuration():
-    """Fail fast when strict mapping mode is requested but unavailable."""
-    mode = _resolve_mapping_mode()
-    if (
-        mode == "auto"
-        and HAND_EYE_CAMERA_TO_ARM_T is None
-        and CAM_ARM_RIGID_CAL is None
-        and CAM_ARM_AFFINE_T is None
-        and not ALLOW_COARSE_FALLBACK
-    ):
-        raise RuntimeError(
-            "Requested precise mapping mode is unavailable and coarse fallback is disabled. "
-            "Provide hand_eye_transform.json or cam_arm_points.csv calibration."
-        )
-    if mode == "hand_eye" and HAND_EYE_CAMERA_TO_ARM_T is None and not ALLOW_COARSE_FALLBACK:
-        raise RuntimeError(
-            "CAMERA_MAPPING_MODE=hand_eye requires hand_eye_transform.json, "
-            "but no valid hand-eye transform is loaded."
-        )
-    if mode == "calibrated_rigid" and CAM_ARM_RIGID_CAL is None and not ALLOW_COARSE_FALLBACK:
-        raise RuntimeError(
-            "CAMERA_MAPPING_MODE=calibrated_rigid requires valid cam_arm_points.csv "
-            "(>=4 points, acceptable fit error), but no valid rigid calibration is loaded."
-        )
-    if mode == "calibrated_affine" and CAM_ARM_AFFINE_T is None and not ALLOW_COARSE_FALLBACK:
-        raise RuntimeError(
-            "CAMERA_MAPPING_MODE=calibrated_affine requires valid cam_arm_points.csv "
-            "(>=4 points, acceptable fit error), but no valid calibration is loaded."
-        )
-
-
-def _has_precise_mapping_loaded():
-    return (
-        HAND_EYE_CAMERA_TO_ARM_T is not None
-        or CAM_ARM_RIGID_CAL is not None
-        or CAM_ARM_AFFINE_T is not None
-    )
 
 
 def camera_to_arm_frame(xyz_cm_dict):
@@ -639,36 +291,19 @@ def camera_to_arm_frame(xyz_cm_dict):
     cam = np.array([xyz_cm_dict["x"], xyz_cm_dict["y"], xyz_cm_dict["z"]],
                    dtype=float) / 100.0
     cam = cam * CAMERA_AXIS_SCALE
-    mode = _resolve_mapping_mode()
-    cam_h = np.append(cam, 1.0)
-
-    if mode in {"auto", "hand_eye"} and HAND_EYE_CAMERA_TO_ARM_T is not None:
-        arm_cal = (HAND_EYE_CAMERA_TO_ARM_T @ cam_h)[:3]
+    if HAND_EYE_CAMERA_TO_ARM_T is not None:
+        arm_cal = (HAND_EYE_CAMERA_TO_ARM_T @ np.append(cam, 1.0))[:3]
         return ARM_TARGET_AFFINE @ arm_cal + ARM_TARGET_BIAS_M
 
-    if mode in {"auto", "calibrated_rigid"} and CAM_ARM_RIGID_CAL is not None:
-        rigid = CAM_ARM_RIGID_CAL
-        arm_cal = rigid["s"] * (rigid["R"] @ cam) + rigid["t"]
-        z_comp = rigid.get("z_comp", np.array([0.0, 0.0], dtype=float))
-        arm_cal[2] += float(z_comp[0] * cam[2] + z_comp[1])
-        return ARM_TARGET_AFFINE @ arm_cal + ARM_TARGET_BIAS_M
-
-    if mode in {"auto", "calibrated_affine"} and CAM_ARM_AFFINE_T is not None:
-        arm_cal = (CAM_ARM_AFFINE_T @ cam_h)[:3]
-        return ARM_TARGET_AFFINE @ arm_cal + ARM_TARGET_BIAS_M
-
-    if mode in {"auto", "hand_eye", "calibrated_rigid", "calibrated_affine"} and not ALLOW_COARSE_FALLBACK:
-        raise RuntimeError(
-            "Requested precise mapping mode is unavailable and coarse fallback is disabled. "
-            "Provide hand_eye_transform.json or cam_arm_points.csv calibration."
-        )
-
-    # Coarse fallback: FK-anchored camera model  
-    # Use computed camera pose (rotation + origin) from FK at home
-    coarse_target = COARSE_CAMERA_TO_ARM_ROT @ cam + COARSE_CAMERA_ORIGIN_M
-    coarse_target = ARM_TARGET_AFFINE @ coarse_target + ARM_TARGET_BIAS_M
-    coarse_target[2] += COARSE_TARGET_Z_BIAS_M
-    return coarse_target
+    # Base mapping with explicit signs/gain for lateral calibration.
+    arm_nominal = np.array([
+        cam[2],
+        CAMERA_LATERAL_SIGN * CAMERA_LATERAL_GAIN * cam[0],
+        CAMERA_VERTICAL_SIGN * cam[1],
+    ], dtype=float)
+    arm_rot = CAM_TO_ARM_FINE_ROT @ arm_nominal
+    arm_cal = ARM_TARGET_AFFINE @ arm_rot + ARM_TARGET_BIAS_M
+    return arm_cal + CAMERA_OFFSET_M
 
 
 def camera_distance_m(xyz_cm_dict):
@@ -700,9 +335,16 @@ def _project_to_reachable(target_m, arm, safety_margin_m=0.02, min_z=None):
 
 
 def _stem_cut_point_from_center(target_m, arm):
-    """Target point as center + configurable vertical offset in arm-frame Z."""
+    """Target point as center + configurable vertical offset in arm-frame Z,
+    minus a depth pullback in arm-frame X to compensate for gripper-tip
+    protrusion (Z_final_depth = Z_detected_depth - STEM_DEPTH_OFFSET_M).
+    """
     cut_pt = np.array(target_m, dtype=float).copy()
     cut_pt[2] += STEM_VERTICAL_OFFSET_M
+    # Pull the target back along the arm-frame X (depth) axis so the gripper
+    # tip lands on the stem rather than overshooting it.
+    if cut_pt[0] > STEM_DEPTH_OFFSET_M:
+        cut_pt[0] -= STEM_DEPTH_OFFSET_M
     # Never let reach projection drag the stem target below the center+offset.
     cut_pt, was_projected = _project_to_reachable(
         cut_pt,
@@ -882,112 +524,6 @@ def _iterative_jacobian_correction(arm, driver, target_m, q_start, index, total)
     return False, q_curr, last_err, JAC_CORR_MAX_ITERS
 
 
-def _execute_tracking_approach(
-    arm,
-    driver,
-    detector,
-    cap,
-    q_start,
-    q_goal,
-    tomato_xyz_cm,
-    cut_target_m,
-    index,
-    total,
-):
-    """Move toward the target in small closed-loop steps with live refresh."""
-    step_count = max(1, int(APPROACH_TRACKING_CHUNKS))
-    q_curr = np.array(q_start, dtype=float).copy()
-    q_goal = np.array(q_goal, dtype=float).copy()
-    live_xyz_cm = dict(tomato_xyz_cm)
-    live_cut_target_m = np.array(cut_target_m, dtype=float).copy()
-
-    if detector is None or cap is None or not APPROACH_TRACKING_ENABLED or step_count == 1:
-        execute_trajectory(
-            arm,
-            driver,
-            q_curr,
-            q_goal,
-            steps=TRAJ_STEPS_APPROACH,
-            duration_ms=MOVE_DURATION_MS,
-        )
-        return True, arm.joint_angles.copy(), live_xyz_cm, live_cut_target_m
-
-    for step_idx in range(1, step_count + 1):
-        refined_xyz_cm, hits = _refine_target_xyz(
-            detector,
-            cap,
-            live_xyz_cm,
-            window_s=APPROACH_TRACKING_REFINE_S,
-        )
-        if hits < 1:
-            logger.info(
-                f"[{index+1}/{total}] Tracking approach step {step_idx}: no refresh hit; using previous target"
-            )
-        else:
-            live_xyz_cm = refined_xyz_cm
-
-        target_m = camera_to_arm_frame(live_xyz_cm)
-        ik_input_m = np.array(target_m, dtype=float).copy()
-        if not EXACT_CENTER_TARGET:
-            ik_input_m, _ = _project_to_reachable(ik_input_m, arm)
-        elif not arm.is_reachable(ik_input_m):
-            logger.warning(
-                f"[{index+1}/{total}] Tracking approach step {step_idx}: refreshed target outside reach in exact mode"
-            )
-            return False, q_curr, live_xyz_cm, live_cut_target_m
-
-        updated_cut_target_m, cut_projected = _stem_cut_point_from_center(ik_input_m, arm)
-        if EXACT_CENTER_TARGET and cut_projected:
-            logger.warning(
-                f"[{index+1}/{total}] Tracking approach step {step_idx}: refreshed stem target outside reach in exact mode"
-            )
-            return False, q_curr, live_xyz_cm, live_cut_target_m
-
-        accepted, solved, err, iters, q_goal_new, _ = _solve_ik_with_fallback(
-            arm,
-            q_curr,
-            updated_cut_target_m,
-        )
-        logger.info(
-            f"[{index+1}/{total}] Tracking approach step {step_idx}: refresh solve solved={solved}, "
-            f"err={err:.4f}m, iters={iters}, accepted={accepted}"
-        )
-        if not accepted:
-            if EXACT_CENTER_TARGET:
-                logger.warning(
-                    f"[{index+1}/{total}] Tracking approach step {step_idx}: refreshed solve failed in exact mode"
-                )
-                return False, q_curr, live_xyz_cm, live_cut_target_m
-            q_goal_new = q_goal.copy()
-
-        live_cut_target_m = np.array(updated_cut_target_m, dtype=float)
-        q_goal = np.array(q_goal_new, dtype=float)
-
-        remaining_steps = max(1, step_count - step_idx + 1)
-        q_step = q_curr + (q_goal - q_curr) / float(remaining_steps)
-        execute_trajectory(
-            arm,
-            driver,
-            q_curr,
-            q_step,
-            steps=max(3, TRAJ_STEPS_APPROACH // max(1, step_count * 2)),
-            duration_ms=max(350, MOVE_DURATION_MS // max(1, step_count)),
-        )
-        q_curr = arm.joint_angles.copy()
-
-        live_err = float(np.linalg.norm(arm.end_effector_pos(q_curr) - live_cut_target_m))
-        logger.info(
-            f"[{index+1}/{total}] Tracking approach step {step_idx}: updated xyz_cm="
-            f"({live_xyz_cm['x']:.1f}, {live_xyz_cm['y']:.1f}, {live_xyz_cm['z']:.1f}), "
-            f"live_err={live_err*1000.0:.1f}mm"
-        )
-
-        if live_err <= APPROACH_TRACKING_STOP_ERR_M:
-            return True, q_curr, live_xyz_cm, live_cut_target_m
-
-    return True, q_curr, live_xyz_cm, live_cut_target_m
-
-
 # ── Single tomato harvest action ──────────────────────────────────────────────
 def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total, detector=None, cap=None):
     """
@@ -1035,7 +571,8 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total, detector=Non
 
     logger.info(f"[{index+1}/{total}] Arm-frame tomato center: "
                 f"[{center_target_m[0]:.3f}, {center_target_m[1]:.3f}, {center_target_m[2]:.3f}]m")
-    logger.info(f"[{index+1}/{total}] Stem cut target (+{STEM_VERTICAL_OFFSET_M*100.0:.1f}cm Z): "
+    logger.info(f"[{index+1}/{total}] Stem cut target "
+                f"(Z+{STEM_VERTICAL_OFFSET_M*100.0:.1f}cm, depth-{STEM_DEPTH_OFFSET_M*100.0:.1f}cm): "
                 f"[{cut_target_m[0]:.3f}, {cut_target_m[1]:.3f}, {cut_target_m[2]:.3f}]m")
 
     # Center stability gate (from provided intelligent grasp logic):
@@ -1104,23 +641,8 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total, detector=Non
     logger.info(f"[{index+1}/{total}] Approaching tomato center...")
     if DRY_RUN:
         _log_dry_run(f"[{index+1}/{total}] Moving to cut point")
-    approach_ok, q_cut_live, tomato_xyz_cm, cut_target_m = _execute_tracking_approach(
-        arm,
-        driver,
-        detector,
-        cap,
-        q_current,
-        q_cut,
-        tomato_xyz_cm,
-        cut_target_m,
-        index,
-        total,
-    )
-    if not approach_ok:
-        logger.warning(f"[{index+1}/{total}] Tracking approach failed — skipping")
-        arm.set_joint_angles(q_current)
-        return False
-    q_cut = np.array(q_cut_live, dtype=float)
+    execute_trajectory(arm, driver, q_current, q_cut,
+                       steps=TRAJ_STEPS_APPROACH, duration_ms=MOVE_DURATION_MS)
 
     # Jacobian iterative correction from moved pose to stem cut target.
     corr_target = np.array(cut_target_m, dtype=float)
@@ -1138,35 +660,11 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total, detector=Non
             "proceeding with cut at best-effort position"
         )
 
-    if detector is not None and cap is not None and PIXEL_SERVO_ENABLED:
-        pixel_ok, pixel_xyz_cm = _pixel_servo_center_target(
-            arm,
-            driver,
-            detector,
-            cap,
-            tomato_xyz_cm,
-            index,
-            total,
-        )
-        tomato_xyz_cm = pixel_xyz_cm
-        if pixel_ok:
-            logger.info(f"[{index+1}/{total}] Pixel-servo center alignment converged")
-        elif EXACT_CENTER_TARGET:
-            logger.warning(
-                f"[{index+1}/{total}] Pixel-servo did not converge in exact mode; skipping cut"
-            )
-            arm.set_joint_angles(q_current)
-            return False
-        else:
-            logger.warning(
-                f"[{index+1}/{total}] Pixel-servo did not converge; proceeding best-effort"
-            )
-
     # Settling delay
     time.sleep(0.3)
 
     # Visual relock: re-detect center after approach and correct if drifted.
-    if detector is not None and cap is not None and CENTER_RELOCK_ENABLED and _has_precise_mapping_loaded():
+    if detector is not None and cap is not None and CENTER_RELOCK_ENABLED:
         for relock_iter in range(1, max(1, CENTER_RELOCK_MAX_ITERS) + 1):
             relock_xyz_cm, relock_hits = _refine_target_xyz(
                 detector,
@@ -1250,13 +748,18 @@ def harvest_single_tomato(arm, driver, tomato_xyz_cm, index, total, detector=Non
             tomato_xyz_cm = relock_xyz_cm
             time.sleep(0.2)
 
+    # Pixel-space visual-servo refinement (port of intelligent_grasp.py closed-loop PID idea).
+    if VS_ENABLED:
+        corr_target, q_cut = _visual_servo_refine(
+            arm, driver, detector, cap, corr_target, q_cut, index, total
+        )
+
     # Close gripper / scissors to cut the stem
     logger.info(f"[{index+1}/{total}] {'[SKIPPED-DRY-RUN/NO-CUT]' if DRY_RUN or NO_CUT else 'CUTTING'} stem...")
     if not (DRY_RUN or NO_CUT):
         _perform_fast_cut(driver, index=index, total=total)
         logger.info(f"[{index+1}/{total}] Cut complete!")
         time.sleep(0.3)
-        # post-cut actions removed
     else:
         if DRY_RUN:
             _log_dry_run(f"[{index+1}/{total}] Closing gripper ({CUT_GRIPPER_CLOSE_MS}ms)")
@@ -1798,102 +1301,6 @@ def _wait_center_stable(detector, cap, seed_xyz_cm, window_s=CENTER_STABLE_WINDO
     return best_xyz, False, stable_count
 
 
-def _pixel_servo_center_target(arm, driver, detector, cap, seed_xyz_cm, index, total):
-    """Reduce image-plane center error after approach using small joint corrections."""
-    target_xyz = dict(seed_xyz_cm)
-
-    for servo_iter in range(1, max(1, PIXEL_SERVO_MAX_ITERS) + 1):
-        deadline = time.time() + max(0.2, float(PIXEL_SERVO_WINDOW_S))
-        hits = []
-        frame_shape = None
-
-        while time.time() < deadline:
-            _drain_camera_frames(cap, count=1)
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                continue
-            frame_shape = frame.shape
-
-            detections = detector.detect(frame, use_tracker=False)
-            if not detections:
-                continue
-
-            best = None
-            best_d = 1e9
-            for det in detections:
-                xyz = det.get("xyz_cm")
-                cxy = det.get("center_px")
-                if not xyz or not cxy:
-                    continue
-                d = float(np.linalg.norm([
-                    float(xyz["x"]) - float(target_xyz["x"]),
-                    float(xyz["y"]) - float(target_xyz["y"]),
-                    float(xyz["z"]) - float(target_xyz["z"]),
-                ]))
-                if d < best_d:
-                    best_d = d
-                    best = det
-
-            if best is not None:
-                hits.append(best)
-                if len(hits) >= max(1, PIXEL_SERVO_MIN_HITS):
-                    break
-
-        if not hits or frame_shape is None:
-            logger.warning(
-                f"[{index+1}/{total}] Pixel-servo {servo_iter}: no re-detection after approach"
-            )
-            return False, target_xyz
-
-        avg_cx = float(np.mean([float(det["center_px"][0]) for det in hits]))
-        avg_cy = float(np.mean([float(det["center_px"][1]) for det in hits]))
-        avg_xyz = {
-            "x": float(np.mean([float(det["xyz_cm"]["x"]) for det in hits])),
-            "y": float(np.mean([float(det["xyz_cm"]["y"]) for det in hits])),
-            "z": float(np.mean([float(det["xyz_cm"]["z"]) for det in hits])),
-        }
-        target_xyz = avg_xyz
-
-        frame_h, frame_w = frame_shape[:2]
-        err_x = avg_cx - (frame_w / 2.0)
-        err_y = avg_cy - (frame_h / 2.0)
-        logger.info(
-            f"[{index+1}/{total}] Pixel-servo {servo_iter}: err_px=({err_x:.1f}, {err_y:.1f}), "
-            f"hits={len(hits)}"
-        )
-
-        if abs(err_x) <= PIXEL_SERVO_THRESH_X_PX and abs(err_y) <= PIXEL_SERVO_THRESH_Y_PX:
-            return True, target_xyz
-
-        q_now = np.array(arm.joint_angles, dtype=float)
-        q_next = q_now.copy()
-        d_base = PIXEL_SERVO_BASE_SIGN * PIXEL_SERVO_BASE_GAIN * err_x
-        d_shoulder = PIXEL_SERVO_VERTICAL_SIGN * PIXEL_SERVO_SHOULDER_GAIN * err_y
-        d_elbow = PIXEL_SERVO_VERTICAL_SIGN * PIXEL_SERVO_ELBOW_GAIN * err_y
-        d_wrist = PIXEL_SERVO_VERTICAL_SIGN * PIXEL_SERVO_WRIST_GAIN * err_y
-
-        delta = np.array([d_base, d_shoulder, d_elbow, d_wrist, 0.0], dtype=float)
-        step_norm = float(np.linalg.norm(delta[:4]))
-        max_step = max(1e-6, float(PIXEL_SERVO_MAX_STEP_RAD))
-        if step_norm > max_step:
-            delta *= max_step / step_norm
-
-        q_next[:4] += delta[:4]
-        arm.set_joint_angles(q_next)
-        q_next = arm.joint_angles.copy()
-        execute_trajectory(
-            arm,
-            driver,
-            q_now,
-            q_next,
-            steps=8,
-            duration_ms=max(400, PIXEL_SERVO_MOVE_MS),
-        )
-        time.sleep(0.15)
-
-    return False, target_xyz
-
-
 def _harvest_sequence(arm, driver, tomatoes, detector=None, cap=None):
     harvested = 0
     n = len(tomatoes)
@@ -1950,26 +1357,22 @@ def run_harvesting(sim_mode=False):
     if TEST_CYCLES:
         logger.info(f"TEST MODE — Limiting to {TEST_CYCLES} cycle(s)")
     logger.info(
-        f"3D mapping: CAMERA_MOUNT_FRAME={CAMERA_MOUNT_FRAME}, "
-        f"CAMERA_MOUNT_LOCAL_OFFSET_M={CAMERA_MOUNT_LOCAL_OFFSET_M.tolist()}, "
+        f"3D mapping: CAMERA_OFFSET_M={CAMERA_OFFSET_M.tolist()}, "
         f"CAMERA_AXIS_SCALE={CAMERA_AXIS_SCALE.tolist()}, "
+        f"CAMERA_LATERAL_SIGN={CAMERA_LATERAL_SIGN:.2f}, "
+        f"CAMERA_LATERAL_GAIN={CAMERA_LATERAL_GAIN:.2f}, "
+        f"CAMERA_VERTICAL_SIGN={CAMERA_VERTICAL_SIGN:.2f}, "
         f"ARM_TARGET_AFFINE={ARM_TARGET_AFFINE.tolist()}, "
         f"ARM_TARGET_BIAS_M={ARM_TARGET_BIAS_M.tolist()}, "
-        f"CAMERA_MAPPING_MODE={_resolve_mapping_mode()}, "
-        f"HAS_HAND_EYE={HAND_EYE_CAMERA_TO_ARM_T is not None}, "
-        f"HAS_CAM_ARM_RIGID={CAM_ARM_RIGID_CAL is not None}, "
-        f"HAS_CAM_ARM_AFFINE={CAM_ARM_AFFINE_T is not None}, "
-        f"ALLOW_COARSE_FALLBACK={ALLOW_COARSE_FALLBACK}, "
+        f"CAMERA_MAPPING_MODE={'hand_eye' if HAND_EYE_CAMERA_TO_ARM_T is not None else 'coarse'}, "
         f"EXACT_CENTER_TARGET={EXACT_CENTER_TARGET}"
     )
     if HAND_EYE_CAMERA_TO_ARM_T is not None:
         logger.info(f"Loaded hand-eye transform from {HAND_EYE_FILE}")
-    elif CAM_ARM_RIGID_CAL is not None:
-        logger.info(f"Loaded camera-arm rigid calibration from {CAM_ARM_POINTS_FILE}")
-    elif CAM_ARM_AFFINE_T is not None:
-        logger.info(f"Loaded camera-arm affine calibration from {CAM_ARM_POINTS_FILE}")
     else:
-        logger.info("No precise camera-arm calibration loaded; using coarse camera-to-arm mapping.")
+        logger.info(
+            "No hand-eye transform file found; using coarse camera-to-arm mapping."
+        )
     if os.path.isfile(ARM_BIAS_FILE):
         logger.info(f"Loaded arm bias calibration from {ARM_BIAS_FILE}")
     logger.info(
@@ -1977,7 +1380,6 @@ def run_harvesting(sim_mode=False):
         f"FOCAL_LENGTH_PX={'AUTO-DEFAULT(700)' if FOCAL_LENGTH_PX is None else FOCAL_LENGTH_PX}, "
         "(set env FOCAL_LENGTH_PX for calibrated depth)"
     )
-    _validate_mapping_configuration()
 
     # Initialise subsystems
     detector = TomatoDetector(imgsz=416, focal_length_px=FOCAL_LENGTH_PX)
@@ -2234,7 +1636,6 @@ def main():
                     if not (DRY_RUN or NO_CUT):
                         logger.info(f"[INFO] CUTTING stem of tomato #{i+1}...")
                         _perform_fast_cut(driver, index=i, total=len(tomatoes))
-                        # post-cut actions removed
                     else:
                         if DRY_RUN:
                             _log_dry_run(f"[INFO] Tomato #{i+1}: Closing gripper ({CUT_GRIPPER_CLOSE_MS}ms)")
@@ -2254,7 +1655,7 @@ def main():
                     execute_trajectory(arm, driver, q_current, home_angles, 
                                      steps=TRAJ_STEPS_RETRACT, duration_ms=RETRACT_DURATION_MS)
                     arm.set_joint_angles(home_angles)
-                    driver.move_servos(home_pulses, duration_ms=6000)
+                    driver.move_servos(home_pulses, duration_ms=3000)
                 else:
                     _log_dry_run("Returning arm to home position")
                 time.sleep(RETRACT_DELAY_S)
