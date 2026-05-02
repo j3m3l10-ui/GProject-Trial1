@@ -265,6 +265,8 @@ def main():
                         help="Camera index (default: 0)")
     args = parser.parse_args()
 
+    logger.info("Hello, Tomato Harvesting Robot!")
+
     global CAMERA_INDEX
     CAMERA_INDEX = args.camera
 
