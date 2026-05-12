@@ -340,13 +340,18 @@ class HarvestPipelineTest(unittest.TestCase):
             confirm_seconds=main.CONFIRM_SECONDS,
             confirm_frames=main.CONFIRM_FRAMES,
             camera_index=main.CAMERA_INDEX,
+            camera_source=main.DEFAULT_CAMERA_SOURCE,
+            ros_image_topic=main.DEFAULT_ROS_IMAGE_TOPIC,
+            ros_frame_timeout=main.ROS_FRAME_TIMEOUT_S,
             servo_backend=DEFAULT_SERVO_BACKEND,
             uart_port=DEFAULT_UART_PORT,
             baud=DEFAULT_BAUD)
 
     def test_main_passes_servo_backend_cli_options(self):
         with mock.patch.object(sys, "argv", [
-                "main.py", "--servo-backend", "sdk", "--uart-port", "/dev/test",
+                "main.py", "--camera-source", "ros", "--ros-image-topic",
+                "/usb_cam/image_raw", "--ros-frame-timeout", "2.5",
+                "--servo-backend", "sdk", "--uart-port", "/dev/test",
                 "--baud", "57600"]), \
                 mock.patch.object(main, "run_harvesting") as run_harvesting:
             main.main()
@@ -356,9 +361,62 @@ class HarvestPipelineTest(unittest.TestCase):
             confirm_seconds=main.CONFIRM_SECONDS,
             confirm_frames=main.CONFIRM_FRAMES,
             camera_index=main.CAMERA_INDEX,
+            camera_source="ros",
+            ros_image_topic="/usb_cam/image_raw",
+            ros_frame_timeout=2.5,
             servo_backend="sdk",
             uart_port="/dev/test",
             baud=57600)
+
+    def test_ros_camera_source_reads_image_topic_frame(self):
+        frame = np.ones((3, 4, 3), dtype=np.uint8)
+
+        class FakeCore:
+            @staticmethod
+            def is_initialized():
+                return False
+
+        class FakeSubscriber:
+            def __init__(self, topic, msg_type, callback, **_kwargs):
+                self.topic = topic
+                self.msg_type = msg_type
+                callback(object())
+
+            def unregister(self):
+                pass
+
+        fake_rospy = types.SimpleNamespace(
+            core=FakeCore,
+            init_node=mock.Mock(),
+            Subscriber=FakeSubscriber,
+            is_shutdown=lambda: False,
+            sleep=lambda _seconds: None,
+        )
+
+        class FakeBridge:
+            def imgmsg_to_cv2(self, _msg, desired_encoding="bgr8"):
+                self.encoding = desired_encoding
+                return frame
+
+        fake_cv_bridge = types.SimpleNamespace(CvBridge=FakeBridge)
+        fake_sensor_msgs = types.ModuleType("sensor_msgs")
+        fake_sensor_msgs_msg = types.ModuleType("sensor_msgs.msg")
+        fake_sensor_msgs_msg.Image = type("Image", (), {})
+
+        with mock.patch.dict(sys.modules, {
+            "rospy": fake_rospy,
+            "cv_bridge": fake_cv_bridge,
+            "sensor_msgs": fake_sensor_msgs,
+            "sensor_msgs.msg": fake_sensor_msgs_msg,
+        }):
+            source, selected = main._open_ros_camera("/usb_cam/image_raw", 0.1)
+
+        self.assertEqual(selected, "/usb_cam/image_raw")
+        self.assertTrue(source.isOpened())
+        ok, got = source.read()
+        self.assertTrue(ok)
+        np.testing.assert_array_equal(got, frame)
+        fake_rospy.init_node.assert_called_once()
 
     def test_camera_auto_open_tries_detected_devices_then_fallbacks(self):
         opened = []

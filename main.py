@@ -30,6 +30,7 @@ import logging
 import os
 import struct
 import sys
+import threading
 import time
 import cv2
 import numpy as np
@@ -57,6 +58,9 @@ GRIPPER_DELAY_S    = 0.6     # wait after gripper command
 RETRACT_DELAY_S    = 1.0     # wait after retract before next scan
 TOMATO_RADIUS_M    = 0.035   # average tomato radius in metres
 CAMERA_INDEX       = -1      # -1 = auto-detect camera
+DEFAULT_CAMERA_SOURCE = "opencv"
+DEFAULT_ROS_IMAGE_TOPIC = "/camera/image_raw"
+ROS_FRAME_TIMEOUT_S = 5.0
 CAMERA_READ_PROBE_FRAMES = 1 # frames required before accepting a camera
 FRAME_GRAB_FAILURE_LIMIT = 3 # reopen camera after this many failed reads
 IK_TOLERANCE_M     = 5e-4    # cutter target must solve to sub-millimetre error
@@ -171,6 +175,100 @@ def _open_camera(camera_index=CAMERA_INDEX):
     return None, None
 
 
+class RosImageSource:
+    """OpenCV-like frame source backed by a ROS image topic."""
+
+    def __init__(self, image_topic=DEFAULT_ROS_IMAGE_TOPIC,
+                 timeout_s=ROS_FRAME_TIMEOUT_S):
+        import rospy
+        from cv_bridge import CvBridge
+        from sensor_msgs.msg import Image
+
+        self.image_topic = image_topic
+        self.timeout_s = timeout_s
+        self.rospy = rospy
+        self.bridge = CvBridge()
+        self._lock = threading.Lock()
+        self._latest_frame = None
+        self._subscriber = None
+        self._opened = False
+
+        if not rospy.core.is_initialized():
+            rospy.init_node("tomato_harvester", anonymous=True,
+                            disable_signals=True)
+
+        self._subscriber = rospy.Subscriber(
+            image_topic, Image, self._callback, queue_size=1,
+            buff_size=2 ** 24)
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline and not rospy.is_shutdown():
+            with self._lock:
+                if self._latest_frame is not None:
+                    self._opened = True
+                    logger.info("ROS camera topic opened: %s", image_topic)
+                    return
+            rospy.sleep(0.05)
+
+        logger.error(
+            "ROS camera topic %s did not publish a frame within %.1fs.",
+            image_topic, timeout_s)
+
+    def _callback(self, msg):
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as e:
+            logger.warning("Could not convert ROS image frame: %s", e)
+            return
+        with self._lock:
+            self._latest_frame = frame
+
+    def isOpened(self):
+        return self._opened
+
+    def read(self):
+        with self._lock:
+            if self._latest_frame is None:
+                return False, None
+            return True, self._latest_frame.copy()
+
+    def release(self):
+        if self._subscriber is not None:
+            self._subscriber.unregister()
+            self._subscriber = None
+
+    def set(self, *_args):
+        return False
+
+
+def _open_ros_camera(image_topic=DEFAULT_ROS_IMAGE_TOPIC,
+                     timeout_s=ROS_FRAME_TIMEOUT_S):
+    try:
+        source = RosImageSource(image_topic=image_topic, timeout_s=timeout_s)
+    except ImportError as e:
+        logger.error(
+            "ROS camera source unavailable: %s. Source your ROS environment "
+            "and install cv_bridge/sensor_msgs.", e)
+        return None, None
+
+    if source.isOpened():
+        return source, image_topic
+
+    source.release()
+    return None, None
+
+
+def _open_frame_source(camera_source=DEFAULT_CAMERA_SOURCE,
+                       camera_index=CAMERA_INDEX,
+                       ros_image_topic=DEFAULT_ROS_IMAGE_TOPIC,
+                       ros_frame_timeout=ROS_FRAME_TIMEOUT_S):
+    if camera_source == "ros":
+        return _open_ros_camera(ros_image_topic, ros_frame_timeout)
+    if camera_source == "opencv":
+        return _open_camera(camera_index)
+    raise ValueError("camera_source must be one of: opencv, ros")
+
+
 def _position_vector_cm(detection):
     xyz = detection["xyz_cm"]
     return np.array([xyz["x"], xyz["y"], xyz["z"]], dtype=float)
@@ -221,6 +319,9 @@ def interpolate_trajectory(q_start, q_end, steps=20):
 def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
                    confirm_frames=CONFIRM_FRAMES,
                    camera_index=CAMERA_INDEX,
+                   camera_source=DEFAULT_CAMERA_SOURCE,
+                   ros_image_topic=DEFAULT_ROS_IMAGE_TOPIC,
+                   ros_frame_timeout=ROS_FRAME_TIMEOUT_S,
                    servo_backend=DEFAULT_SERVO_BACKEND,
                    uart_port=DEFAULT_UART_PORT,
                    baud=DEFAULT_BAUD):
@@ -244,8 +345,12 @@ def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
     driver.go_search_home(duration_ms=1200)
     time.sleep(1.5)
 
-    # Open camera before entering the harvest loop. Auto mode tries /dev/video*.
-    cap, selected_camera = _open_camera(camera_index)
+    # Open camera before entering the harvest loop.
+    cap, selected_camera = _open_frame_source(
+        camera_source=camera_source,
+        camera_index=camera_index,
+        ros_image_topic=ros_image_topic,
+        ros_frame_timeout=ros_frame_timeout)
     if cap is None:
         driver.go_park(duration_ms=1000)
         driver.close()
@@ -270,7 +375,11 @@ def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
                 if frame_grab_failures >= FRAME_GRAB_FAILURE_LIMIT:
                     logger.warning("Reopening camera after repeated frame failures.")
                     cap.release()
-                    cap, selected_camera = _open_camera(camera_index)
+                    cap, selected_camera = _open_frame_source(
+                        camera_source=camera_source,
+                        camera_index=camera_index,
+                        ros_image_topic=ros_image_topic,
+                        ros_frame_timeout=ros_frame_timeout)
                     confirm_buffer.clear()
                     confirm_started_at = None
                     state = "SCANNING"
@@ -464,8 +573,17 @@ def main():
                         help="Run real hardware mode (default; sends UART servo commands)")
     parser.add_argument("--gui", action="store_true",
                         help="Launch the 3D simulation GUI")
+    parser.add_argument("--camera-source",
+                        choices=("opencv", "ros"),
+                        default=DEFAULT_CAMERA_SOURCE,
+                        help="Frame source: opencv uses /dev/video*, ros subscribes to an image topic")
     parser.add_argument("--camera", type=int, default=CAMERA_INDEX,
                         help="Camera index, or -1 to auto-detect (default: -1)")
+    parser.add_argument("--ros-image-topic", default=DEFAULT_ROS_IMAGE_TOPIC,
+                        help=f"ROS sensor_msgs/Image topic (default: {DEFAULT_ROS_IMAGE_TOPIC})")
+    parser.add_argument("--ros-frame-timeout", type=float,
+                        default=ROS_FRAME_TIMEOUT_S,
+                        help=f"Seconds to wait for first ROS frame (default: {ROS_FRAME_TIMEOUT_S})")
     parser.add_argument("--confirm-seconds", type=float, default=CONFIRM_SECONDS,
                         help=f"Seconds to confirm a tomato before moving (default: {CONFIRM_SECONDS})")
     parser.add_argument("--confirm-frames", type=int, default=CONFIRM_FRAMES,
@@ -490,6 +608,9 @@ def main():
                        confirm_seconds=args.confirm_seconds,
                        confirm_frames=args.confirm_frames,
                        camera_index=args.camera,
+                       camera_source=args.camera_source,
+                       ros_image_topic=args.ros_image_topic,
+                       ros_frame_timeout=args.ros_frame_timeout,
                        servo_backend=args.servo_backend,
                        uart_port=args.uart_port,
                        baud=args.baud)

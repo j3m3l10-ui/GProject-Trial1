@@ -68,6 +68,13 @@ camera, pass the known index explicitly:
 python main.py --hardware --camera 1
 ```
 
+If V4L2/OpenCV frame grabbing fails but your camera is already published by
+ROS, run from a sourced ROS shell and subscribe to the image topic instead:
+
+```
+python main.py --hardware --camera-source ros --ros-image-topic /usb_cam/image_raw
+```
+
 ### 4. Run Camera-Only Detection
 
 ```
