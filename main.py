@@ -232,10 +232,12 @@ def _execute_harvest(arm, driver, locked_xyz_cm, frame):
         return
 
     # Move arm along interpolated trajectory: home → cut
+    # Exclude gripper (servo ID 1) — it is independently controlled
     traj = interpolate_trajectory(q_home, q_cut, steps=25)
     for q in traj:
         arm.set_joint_angles(q)
         pulses = angles_to_pulses(q)
+        pulses.pop(1, None)  # don't override gripper during approach
         driver.move_servos(pulses, duration_ms=MOVE_DURATION_MS // 25)
         time.sleep(MOVE_DURATION_MS / 25000.0)
 
