@@ -25,8 +25,10 @@ The arm must be at Search Home for the camera to see the workspace.
 """
 
 import argparse
+import fcntl
 import logging
 import os
+import struct
 import sys
 import time
 import cv2
@@ -55,9 +57,16 @@ GRIPPER_DELAY_S    = 0.6     # wait after gripper command
 RETRACT_DELAY_S    = 1.0     # wait after retract before next scan
 TOMATO_RADIUS_M    = 0.035   # average tomato radius in metres
 CAMERA_INDEX       = -1      # -1 = auto-detect camera
+CAMERA_READ_PROBE_FRAMES = 1 # frames required before accepting a camera
+FRAME_GRAB_FAILURE_LIMIT = 3 # reopen camera after this many failed reads
 IK_TOLERANCE_M     = 5e-4    # cutter target must solve to sub-millimetre error
 IK_MAX_ERROR_M     = 0.005   # never cut with more than 5 mm residual error
 STEM_DIRECTION_ARM_FRAME = np.array([0.0, 0.0, 1.0], dtype=float)
+
+VIDIOC_QUERYCAP = 0x80685600
+V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+V4L2_CAP_VIDEO_CAPTURE_MPLANE = 0x00001000
+V4L2_CAP_DEVICE_CAPS = 0x80000000
 
 # ── Camera-to-arm transform ───────────────────────────────────────────────────
 # Because our camera is Hand-in-Eye (mounted on the wrist), the detected
@@ -89,7 +98,11 @@ def _camera_candidates(camera_index):
 
     candidates = []
     try:
-        for name in sorted(os.listdir("/dev")):
+        video_names = [
+            name for name in os.listdir("/dev")
+            if name.startswith("video") and name[5:].isdigit()
+        ]
+        for name in sorted(video_names, key=lambda n: int(n[5:])):
             if name.startswith("video") and name[5:].isdigit():
                 candidates.append(int(name[5:]))
     except OSError:
@@ -101,17 +114,55 @@ def _camera_candidates(camera_index):
     return candidates
 
 
+def _video_device_supports_capture(idx):
+    """Return False for V4L2 metadata/control nodes that cannot stream frames."""
+    path = f"/dev/video{idx}"
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        buf = bytearray(104)
+        fcntl.ioctl(fd, VIDIOC_QUERYCAP, buf, True)
+        capabilities = struct.unpack_from("I", buf, 84)[0]
+        device_caps = struct.unpack_from("I", buf, 88)[0]
+        caps = device_caps if capabilities & V4L2_CAP_DEVICE_CAPS else capabilities
+        return bool(caps & (V4L2_CAP_VIDEO_CAPTURE |
+                            V4L2_CAP_VIDEO_CAPTURE_MPLANE))
+    except OSError:
+        # If querying fails, let OpenCV try the device and report the real error.
+        return True
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _camera_can_read_frame(cap, idx, probe_frames=CAMERA_READ_PROBE_FRAMES):
+    """Verify an opened capture actually returns frames."""
+    for attempt in range(1, probe_frames + 1):
+        ret, frame = cap.read()
+        if ret and frame is not None and getattr(frame, "size", 0) > 0:
+            return True
+        logger.warning(
+            "Camera index %s opened but did not return a frame "
+            "(probe %s/%s).", idx, attempt, probe_frames)
+    return False
+
+
 def _open_camera(camera_index=CAMERA_INDEX):
     """Open the first usable camera and return (capture, selected_index)."""
     attempted = []
     for idx in _camera_candidates(camera_index):
         attempted.append(idx)
+        if not _video_device_supports_capture(idx):
+            logger.warning("Camera index %s is not a capture device; skipping.", idx)
+            continue
+
         cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-        if cap.isOpened():
-            logger.info(f"Camera opened: index={idx}")
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if cap.isOpened() and _camera_can_read_frame(cap, idx):
+            logger.info(f"Camera opened and read frame: index={idx}")
             return cap, idx
         cap.release()
-        logger.warning(f"Camera index {idx} did not open.")
+        logger.warning(f"Camera index {idx} did not open or did not stream frames.")
 
     logger.error(
         "Cannot open camera. Tried indexes: %s. Use --camera N if your camera "
@@ -205,13 +256,29 @@ def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
     confirm_started_at = None
     state = "SCANNING"   # SCANNING → CONFIRMING → ACTING → RETRACTING
     last_status_message = ""
+    frame_grab_failures = 0
 
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                logger.warning("Frame grab failed")
+                frame_grab_failures += 1
+                logger.warning(
+                    "Frame grab failed (%s/%s) on camera index %s.",
+                    frame_grab_failures, FRAME_GRAB_FAILURE_LIMIT,
+                    selected_camera)
+                if frame_grab_failures >= FRAME_GRAB_FAILURE_LIMIT:
+                    logger.warning("Reopening camera after repeated frame failures.")
+                    cap.release()
+                    cap, selected_camera = _open_camera(camera_index)
+                    confirm_buffer.clear()
+                    confirm_started_at = None
+                    state = "SCANNING"
+                    frame_grab_failures = 0
+                    if cap is None:
+                        break
                 continue
+            frame_grab_failures = 0
 
             if state in ("SCANNING", "CONFIRMING"):
                 detections = detector.detect(frame)

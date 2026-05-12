@@ -267,6 +267,9 @@ class HarvestPipelineTest(unittest.TestCase):
             def __init__(self, *_args, **_kwargs):
                 pass
 
+            def set(self, *_args):
+                return True
+
             def isOpened(self):
                 return True
 
@@ -367,8 +370,14 @@ class HarvestPipelineTest(unittest.TestCase):
                 self.backend = backend
                 opened.append((idx, backend))
 
+            def set(self, *_args):
+                return True
+
             def isOpened(self):
                 return self.idx == 2
+
+            def read(self):
+                return True, np.zeros((2, 2, 3), dtype=np.uint8)
 
             def release(self):
                 released.append(self.idx)
@@ -381,6 +390,41 @@ class HarvestPipelineTest(unittest.TestCase):
         self.assertEqual(cap.idx, 2)
         self.assertEqual(opened[0], (2, main.cv2.CAP_V4L2))
         self.assertNotIn(2, released)
+
+    def test_camera_auto_open_skips_devices_that_do_not_stream_frames(self):
+        opened = []
+        released = []
+
+        class FakeCapture:
+            def __init__(self, idx, backend):
+                self.idx = idx
+                self.backend = backend
+                opened.append(idx)
+
+            def set(self, *_args):
+                return True
+
+            def isOpened(self):
+                return True
+
+            def read(self):
+                if self.idx == 25:
+                    return True, np.zeros((2, 2, 3), dtype=np.uint8)
+                return False, None
+
+            def release(self):
+                released.append(self.idx)
+
+        with mock.patch.object(main.os, "listdir",
+                               return_value=["video24", "video25"]), \
+                mock.patch.object(main.cv2, "VideoCapture", FakeCapture):
+            cap, idx = main._open_camera(-1)
+
+        self.assertEqual(idx, 25)
+        self.assertEqual(cap.idx, 25)
+        self.assertEqual(opened[:2], [24, 25])
+        self.assertIn(24, released)
+        self.assertNotIn(25, released)
 
 
 if __name__ == "__main__":
