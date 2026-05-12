@@ -25,6 +25,8 @@ FRAME_HEADER     = bytes([0x55, 0x55])
 CMD_SERVO_MOVE   = 1    # SERVO_MOVE_TIME_WRITE
 CMD_SERVO_READ   = 28   # SERVO_POS_READ
 BROADCAST_ID     = 254
+GRIPPER_OPEN_PULSE = 200
+GRIPPER_CLOSE_PULSE = 700
 
 # ── Default UART settings ─────────────────────────────────────────────────────
 DEFAULT_UART_PORT = "/dev/ttyAMA0"
@@ -110,11 +112,11 @@ class ServoDriver:
     # ── Gripper control ────────────────────────────────────────────────────────
     def gripper_open(self, duration_ms: int = 400):
         """Open the gripper (ID 1) — wide open for approach."""
-        self.move_servo(1, 200, duration_ms)
+        self.move_servo(1, GRIPPER_OPEN_PULSE, duration_ms)
 
     def gripper_close(self, duration_ms: int = 400):
         """Close the gripper (ID 1) — cutting/gripping action."""
-        self.move_servo(1, 700, duration_ms)
+        self.move_servo(1, GRIPPER_CLOSE_PULSE, duration_ms)
 
     # ── Search Home position ───────────────────────────────────────────────────
     def go_search_home(self, duration_ms: int = 1000):

@@ -36,7 +36,7 @@ from arm_controller import (
     FiveDOFArm, angles_to_pulses, search_home_angles,
     compute_cut_point, SERVO_IDS, SEARCH_HOME_PULSES,
 )
-from servo_driver import ServoDriver
+from servo_driver import ServoDriver, GRIPPER_OPEN_PULSE
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -305,12 +305,16 @@ def _execute_harvest(arm, driver, locked_xyz_cm, frame):
         return False, reason
 
     # Move arm along interpolated trajectory: home → cut
-    # Exclude gripper (servo ID 1) — it is independently controlled
+    target_pulses = angles_to_pulses(q_cut)
+    target_pulses[1] = GRIPPER_OPEN_PULSE
+    logger.info(f"Moving all 5 servos toward cut point: pulses={target_pulses}")
     traj = interpolate_trajectory(q_home, q_cut, steps=25)
     for q in traj:
         arm.set_joint_angles(q)
         pulses = angles_to_pulses(q)
-        pulses.pop(1, None)  # don't override gripper during approach
+        # The fifth servo is the gripper, so keep it open while still sending a
+        # synchronized command for every servo on each approach step.
+        pulses[1] = GRIPPER_OPEN_PULSE
         driver.move_servos(pulses, duration_ms=MOVE_DURATION_MS // 25)
         time.sleep(MOVE_DURATION_MS / 25000.0)
 

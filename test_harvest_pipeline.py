@@ -11,7 +11,8 @@ except ImportError:
     sys.modules["ultralytics"] = types.SimpleNamespace(YOLO=object)
 
 import main
-from arm_controller import CUT_GAP_M, compute_cut_point
+from arm_controller import CUT_GAP_M, FiveDOFArm, compute_cut_point, search_home_angles
+from servo_driver import GRIPPER_OPEN_PULSE
 from vision import TomatoDetector
 
 
@@ -122,6 +123,27 @@ class HarvestPipelineTest(unittest.TestCase):
         self.assertFalse(any(call[0] == "move" for call in driver.calls))
         self.assertFalse(harvest_ok)
         self.assertIn("IK failed", reason)
+
+    def test_harvest_approach_commands_all_five_servos(self):
+        arm = FiveDOFArm()
+        arm.set_joint_angles(search_home_angles())
+        driver = FakeDriver()
+        locked = {"x": 0.0, "y": 0.0, "z": 10.0}
+
+        harvest_ok, reason = main._execute_harvest(arm, driver, locked, frame=None)
+
+        approach_moves = [
+            call for call in driver.calls
+            if call[0] == "move" and call[2] == main.MOVE_DURATION_MS // 25
+        ]
+        self.assertTrue(harvest_ok, reason)
+        self.assertEqual(reason, "cut complete")
+        self.assertEqual(len(approach_moves), 26)
+        self.assertTrue(all(set(call[1]) == {1, 3, 4, 5, 6}
+                            for call in approach_moves))
+        self.assertTrue(all(call[1][1] == GRIPPER_OPEN_PULSE
+                            for call in approach_moves))
+        self.assertIn(("close", 500), driver.calls)
 
     def test_confirmation_reaches_harvest_with_rolling_buffer(self):
         class Clock:
