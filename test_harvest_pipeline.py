@@ -197,6 +197,8 @@ class HarvestPipelineTest(unittest.TestCase):
 
         def fake_wait_key(_delay):
             wait_calls["count"] += 1
+            if harvest_calls:
+                return ord("q")
             return ord("q") if wait_calls["count"] >= 35 else -1
 
         def fake_execute(_arm, _driver, locked_xyz_cm, _frame):
