@@ -9,7 +9,7 @@ Workflow:
   2. VISION → Continuous detection loop on live camera
   3. LOCK → When a ripe tomato is detected consistently for CONFIRM_SECONDS,
              lock its 3D position
-  4. ARM → Solve IK for the cut point (1 cm from tomato surface toward stem)
+  4. ARM → Solve IK for the cut point (1 cm above tomato surface along stem)
   5. ARM → Move from Search Home → cut pose over safe trajectory
   6. ARM → Close gripper / scissors to cut
   7. ARM → Retract to Search Home
@@ -59,7 +59,7 @@ CAMERA_INDEX       = 0       # default camera
 # into arm-base coords.  CALIBRATE THESE VALUES on the real robot.
 #
 # Approximate offsets when arm is at Search Home position:
-#   Camera is ~0.25m in front of the base, ~0.20m above ground, angled down.
+#   Camera is ~0.15m in front of the base, ~0.18m above ground, angled down.
 CAMERA_OFFSET_M = np.array([0.15, 0.0, 0.18], dtype=float)
 
 
@@ -210,7 +210,7 @@ def _execute_harvest(arm, driver, locked_xyz_cm, frame):
         logger.warning("Target is OUT OF REACH — skipping.")
         return
 
-    # Compute cut point (1 cm from tomato surface toward base/stem)
+    # Compute cut point (1 cm above tomato surface along stem / +Z)
     edge_pt, cut_pt = compute_cut_point(target_m, TOMATO_RADIUS_M, arm.base_pos)
     logger.info(f"Cut point (m): {cut_pt}")
 
