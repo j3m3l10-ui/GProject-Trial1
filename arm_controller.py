@@ -118,13 +118,17 @@ class FiveDOFArm:
         self.joint_angles = angles
 
     # ── Numerical Jacobian ─────────────────────────────────────────────────────
+    # Only joints 0–3 participate in positioning; joint 4 (gripper) is excluded.
+    IK_JOINTS = 4
+
     def jacobian(self, joint_angles=None, eps=1e-6):
         q = self.joint_angles.copy() if joint_angles is None \
             else np.array(joint_angles, dtype=float).copy()
-        J = np.zeros((3, len(q)), dtype=float)
+        J = np.zeros((3, self.IK_JOINTS), dtype=float)
         f0 = self.end_effector_pos(q)
-        for j in range(len(q)):
-            dq = np.zeros_like(q); dq[j] = eps
+        for j in range(self.IK_JOINTS):
+            dq = np.zeros_like(q)
+            dq[j] = eps
             J[:, j] = (self.end_effector_pos(q + dq) - f0) / eps
         return J
 
@@ -141,8 +145,8 @@ class FiveDOFArm:
             J = self.jacobian(q)
             A = J @ J.T + (lam ** 2) * np.eye(3)
             dq = J.T @ np.linalg.solve(A, err_vec)
-            q += dq
-            for i in range(len(q)):
+            q[:self.IK_JOINTS] += dq
+            for i in range(self.IK_JOINTS):
                 q[i] = np.clip(q[i], self.joint_limits[i, 0],
                                 self.joint_limits[i, 1])
         self.set_joint_angles(q)
@@ -162,7 +166,7 @@ class FiveDOFArm:
 def radians_to_pulse(joint_idx, angle_rad):
     """Convert a joint angle (radians) to a servo pulse value."""
     sign = -1 if joint_idx in INVERTED_JOINTS else 1
-    pulse = NEUTRAL_PULSE + int(sign * angle_rad * PULSE_PER_RAD)
+    pulse = NEUTRAL_PULSE + round(sign * angle_rad * PULSE_PER_RAD)
     lo = SAFE_PULSE_MIN.get(joint_idx, PULSE_MIN)
     hi = SAFE_PULSE_MAX.get(joint_idx, PULSE_MAX)
     return max(lo, min(hi, pulse))
@@ -197,18 +201,12 @@ def search_home_angles():
 def compute_cut_point(tomato_center_m, tomato_radius_m, arm_base):
     """
     Given tomato position in arm-frame (metres), compute the point
-    1 cm away from the tomato surface toward the base (stem cut location).
+    1 cm above the tomato surface along the stem (world +Z axis).
     Returns (edge_point, cut_point) both as numpy arrays.
     """
-    base = np.array(arm_base, dtype=float)
     center = np.array(tomato_center_m, dtype=float)
-    direction = center - base
-    dist = np.linalg.norm(direction)
-    if dist < 1e-6:
-        direction = np.array([1.0, 0.0, 0.0])
-    else:
-        direction = direction / dist
-    edge_point = center - direction * tomato_radius_m
-    cut_gap = 0.01  # 1 cm
-    cut_point = center - direction * (tomato_radius_m + cut_gap)
+    stem_direction = np.array([0.0, 0.0, 1.0])  # stems grow upward (+Z)
+    edge_point = center + stem_direction * tomato_radius_m
+    cut_gap = 0.01  # 1 cm above the surface
+    cut_point = center + stem_direction * (tomato_radius_m + cut_gap)
     return edge_point, cut_point
