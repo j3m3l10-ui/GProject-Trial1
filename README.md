@@ -45,7 +45,21 @@ python detect.py
 ```
 
 Both commands run the integrated hardware pipeline: camera detection → IK →
-UART servo commands on `/dev/ttyAMA0`.
+servo commands. The default servo backend tries Hiwonder's
+`Board.setBusServoPulse` SDK first, then falls back to raw UART on
+`/dev/ttyAMA0`.
+
+If the arm still does not move, force the hardware backend explicitly:
+
+```
+python main.py --hardware --servo-backend sdk
+```
+
+or:
+
+```
+python main.py --hardware --servo-backend uart --uart-port /dev/ttyAMA0
+```
 
 Camera auto-detection is enabled by default. If OpenCV still cannot open the
 camera, pass the known index explicitly:
