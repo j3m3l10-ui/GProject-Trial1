@@ -26,6 +26,7 @@ The arm must be at Search Home for the camera to see the workspace.
 
 import argparse
 import logging
+import os
 import sys
 import time
 import cv2
@@ -50,7 +51,7 @@ MOVE_DURATION_MS   = 800     # servo move duration for arm motion
 GRIPPER_DELAY_S    = 0.6     # wait after gripper command
 RETRACT_DELAY_S    = 1.0     # wait after retract before next scan
 TOMATO_RADIUS_M    = 0.035   # average tomato radius in metres
-CAMERA_INDEX       = 0       # default camera
+CAMERA_INDEX       = -1      # -1 = auto-detect camera
 IK_TOLERANCE_M     = 5e-4    # cutter target must solve to sub-millimetre error
 IK_MAX_ERROR_M     = 0.005   # never cut with more than 5 mm residual error
 STEM_DIRECTION_ARM_FRAME = np.array([0.0, 0.0, 1.0], dtype=float)
@@ -76,6 +77,44 @@ def camera_to_arm_frame(xyz_cm_dict):
     arm_y = -cam[0] + CAMERA_OFFSET_M[1]  # left/right
     arm_z = -cam[1] + CAMERA_OFFSET_M[2]  # up/down
     return np.array([arm_x, arm_y, arm_z], dtype=float)
+
+
+def _camera_candidates(camera_index):
+    """Return camera indexes to try. -1 means auto-detect."""
+    if camera_index >= 0:
+        return [camera_index]
+
+    candidates = []
+    try:
+        for name in sorted(os.listdir("/dev")):
+            if name.startswith("video") and name[5:].isdigit():
+                candidates.append(int(name[5:]))
+    except OSError:
+        pass
+
+    for idx in range(6):
+        if idx not in candidates:
+            candidates.append(idx)
+    return candidates
+
+
+def _open_camera(camera_index=CAMERA_INDEX):
+    """Open the first usable camera and return (capture, selected_index)."""
+    attempted = []
+    for idx in _camera_candidates(camera_index):
+        attempted.append(idx)
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        if cap.isOpened():
+            logger.info(f"Camera opened: index={idx}")
+            return cap, idx
+        cap.release()
+        logger.warning(f"Camera index {idx} did not open.")
+
+    logger.error(
+        "Cannot open camera. Tried indexes: %s. Use --camera N if your camera "
+        "is on a known index, or check that /dev/video* exists and the user has "
+        "video permissions.", attempted)
+    return None, None
 
 
 def _position_vector_cm(detection):
@@ -126,7 +165,8 @@ def interpolate_trajectory(q_start, q_end, steps=20):
 
 # ── Main harvesting loop ──────────────────────────────────────────────────────
 def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
-                   confirm_frames=CONFIRM_FRAMES):
+                   confirm_frames=CONFIRM_FRAMES,
+                   camera_index=CAMERA_INDEX):
     mode = "sim" if sim_mode else "real"
     logger.info(f"Starting harvesting system in {mode.upper()} mode")
     if not sim_mode:
@@ -144,12 +184,12 @@ def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
     driver.go_search_home(duration_ms=1200)
     time.sleep(1.5)
 
-    # Open camera
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        logger.error("Cannot open camera!")
+    # Open camera before entering the harvest loop. Auto mode tries /dev/video*.
+    cap, selected_camera = _open_camera(camera_index)
+    if cap is None:
+        driver.go_park(duration_ms=1000)
+        driver.close()
         return
-    logger.info(f"Camera opened: index={CAMERA_INDEX}")
 
     # Detection confirmation buffer
     confirm_buffer = []  # list of (timestamp, detection_dict)
@@ -238,7 +278,9 @@ def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
                         confirm_started_at = None
 
                 # Show status on annotated frame
-                status_text = f"Mode: {mode.upper()}  State: {state}"
+                status_text = (
+                    f"Mode: {mode.upper()}  Camera: {selected_camera}  "
+                    f"State: {state}")
                 if state == "CONFIRMING":
                     elapsed = (
                         now - confirm_started_at
@@ -346,8 +388,8 @@ def main():
                         help="Run real hardware mode (default; sends UART servo commands)")
     parser.add_argument("--gui", action="store_true",
                         help="Launch the 3D simulation GUI")
-    parser.add_argument("--camera", type=int, default=0,
-                        help="Camera index (default: 0)")
+    parser.add_argument("--camera", type=int, default=CAMERA_INDEX,
+                        help="Camera index, or -1 to auto-detect (default: -1)")
     parser.add_argument("--confirm-seconds", type=float, default=CONFIRM_SECONDS,
                         help=f"Seconds to confirm a tomato before moving (default: {CONFIRM_SECONDS})")
     parser.add_argument("--confirm-frames", type=int, default=CONFIRM_FRAMES,
@@ -356,16 +398,14 @@ def main():
     if args.hardware and args.sim:
         parser.error("--hardware and --sim cannot be used together")
 
-    global CAMERA_INDEX
-    CAMERA_INDEX = args.camera
-
     if args.gui:
         from simulation_gui import launch_gui
         launch_gui()
     else:
         run_harvesting(sim_mode=args.sim,
                        confirm_seconds=args.confirm_seconds,
-                       confirm_frames=args.confirm_frames)
+                       confirm_frames=args.confirm_frames,
+                       camera_index=args.camera)
 
 
 if __name__ == "__main__":

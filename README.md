@@ -47,6 +47,13 @@ python detect.py
 Both commands run the integrated hardware pipeline: camera detection → IK →
 UART servo commands on `/dev/ttyAMA0`.
 
+Camera auto-detection is enabled by default. If OpenCV still cannot open the
+camera, pass the known index explicitly:
+
+```
+python main.py --hardware --camera 1
+```
+
 ### 4. Run Camera-Only Detection
 
 ```

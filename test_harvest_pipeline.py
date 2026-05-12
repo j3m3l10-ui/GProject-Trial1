@@ -239,7 +239,33 @@ class HarvestPipelineTest(unittest.TestCase):
         run_harvesting.assert_called_once_with(
             sim_mode=False,
             confirm_seconds=main.CONFIRM_SECONDS,
-            confirm_frames=main.CONFIRM_FRAMES)
+            confirm_frames=main.CONFIRM_FRAMES,
+            camera_index=main.CAMERA_INDEX)
+
+    def test_camera_auto_open_tries_detected_devices_then_fallbacks(self):
+        opened = []
+        released = []
+
+        class FakeCapture:
+            def __init__(self, idx, backend):
+                self.idx = idx
+                self.backend = backend
+                opened.append((idx, backend))
+
+            def isOpened(self):
+                return self.idx == 2
+
+            def release(self):
+                released.append(self.idx)
+
+        with mock.patch.object(main.os, "listdir", return_value=["video2"]), \
+                mock.patch.object(main.cv2, "VideoCapture", FakeCapture):
+            cap, idx = main._open_camera(-1)
+
+        self.assertEqual(idx, 2)
+        self.assertEqual(cap.idx, 2)
+        self.assertEqual(opened[0], (2, main.cv2.CAP_V4L2))
+        self.assertNotIn(2, released)
 
 
 if __name__ == "__main__":
