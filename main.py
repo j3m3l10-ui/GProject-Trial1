@@ -43,8 +43,8 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-CONFIRM_SECONDS    = 5.0     # seconds a tomato must be visible before acting
-CONFIRM_FRAMES     = 8       # minimum detections within the confirm window
+CONFIRM_SECONDS    = 1.0     # seconds a tomato must be visible before acting
+CONFIRM_FRAMES     = 3       # minimum detections within the confirm window
 CONFIRM_POSITION_TOLERANCE_CM = 6.0  # restart confirmation if target jumps
 MOVE_DURATION_MS   = 800     # servo move duration for arm motion
 GRIPPER_DELAY_S    = 0.6     # wait after gripper command
@@ -125,9 +125,12 @@ def interpolate_trajectory(q_start, q_end, steps=20):
 
 
 # ── Main harvesting loop ──────────────────────────────────────────────────────
-def run_harvesting(sim_mode=False):
+def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
+                   confirm_frames=CONFIRM_FRAMES):
     mode = "sim" if sim_mode else "real"
     logger.info(f"Starting harvesting system in {mode.upper()} mode")
+    if not sim_mode:
+        logger.info("Hardware mode enabled: servo commands will be sent to UART.")
 
     # Initialise subsystems
     detector = TomatoDetector()
@@ -168,7 +171,7 @@ def run_harvesting(sim_mode=False):
 
                 # Purge old entries outside the confirm window before matching.
                 confirm_buffer = [(t, d) for t, d in confirm_buffer
-                                  if now - t <= CONFIRM_SECONDS]
+                                  if now - t <= confirm_seconds]
 
                 if detections:
                     best, same_target = _select_detection_for_confirmation(
@@ -187,15 +190,15 @@ def run_harvesting(sim_mode=False):
                         state = "CONFIRMING"
                         if confirm_started_at is None:
                             confirm_started_at = now
-                        logger.info(f"Tomato spotted! Confirming for {CONFIRM_SECONDS}s...")
+                        logger.info(f"Tomato spotted! Confirming for {confirm_seconds}s...")
 
                     confirm_elapsed = (
                         now - confirm_started_at
                         if confirm_started_at is not None else 0.0)
 
                     # Check if we have enough consistent detections
-                    if (len(confirm_buffer) >= CONFIRM_FRAMES and
-                            confirm_elapsed >= CONFIRM_SECONDS):
+                    if (len(confirm_buffer) >= confirm_frames and
+                            confirm_elapsed >= confirm_seconds):
                         # Average the confirmed position
                         avg_x, avg_y, avg_z = _buffer_mean_position_cm(confirm_buffer)
                         locked_xyz_cm = {"x": avg_x, "y": avg_y, "z": avg_z}
@@ -229,7 +232,7 @@ def run_harvesting(sim_mode=False):
                 else:
                     # No detection this frame — decay buffer
                     confirm_buffer = [(t, d) for t, d in confirm_buffer
-                                      if now - t <= CONFIRM_SECONDS]
+                                      if now - t <= confirm_seconds]
                     if not confirm_buffer:
                         state = "SCANNING"
                         confirm_started_at = None
@@ -240,7 +243,7 @@ def run_harvesting(sim_mode=False):
                     elapsed = (
                         now - confirm_started_at
                         if confirm_started_at is not None else 0.0)
-                    status_text += f"  ({elapsed:.1f}/{CONFIRM_SECONDS}s, " \
+                    status_text += f"  ({elapsed:.1f}/{confirm_seconds}s, " \
                                    f"{len(confirm_buffer)} frames)"
                 if last_status_message:
                     status_text += f" | {last_status_message[:60]}"
@@ -339,11 +342,19 @@ def main():
         description="Tomato Harvesting Robot — Integrated System")
     parser.add_argument("--sim", action="store_true",
                         help="Run in simulation mode (no real servos)")
+    parser.add_argument("--hardware", action="store_true",
+                        help="Run real hardware mode (default; sends UART servo commands)")
     parser.add_argument("--gui", action="store_true",
                         help="Launch the 3D simulation GUI")
     parser.add_argument("--camera", type=int, default=0,
                         help="Camera index (default: 0)")
+    parser.add_argument("--confirm-seconds", type=float, default=CONFIRM_SECONDS,
+                        help=f"Seconds to confirm a tomato before moving (default: {CONFIRM_SECONDS})")
+    parser.add_argument("--confirm-frames", type=int, default=CONFIRM_FRAMES,
+                        help=f"Detection frames required before moving (default: {CONFIRM_FRAMES})")
     args = parser.parse_args()
+    if args.hardware and args.sim:
+        parser.error("--hardware and --sim cannot be used together")
 
     global CAMERA_INDEX
     CAMERA_INDEX = args.camera
@@ -352,7 +363,9 @@ def main():
         from simulation_gui import launch_gui
         launch_gui()
     else:
-        run_harvesting(sim_mode=args.sim)
+        run_harvesting(sim_mode=args.sim,
+                       confirm_seconds=args.confirm_seconds,
+                       confirm_frames=args.confirm_frames)
 
 
 if __name__ == "__main__":

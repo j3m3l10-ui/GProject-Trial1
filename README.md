@@ -30,16 +30,33 @@ python train.py
 
 This will create a trained model at `runs/detect/train/weights/best.pt`.
 
-### 3. Run Real-Time Detection
+### 3. Run Hardware Harvesting
+
+On the Raspberry Pi with the camera and Hiwonder arm connected:
+
+```
+python main.py --hardware
+```
+
+or:
 
 ```
 python detect.py
 ```
 
-- Press `q` to quit.
-- The script will show bounding boxes, class (ripe/unripe), estimated distance, and print/simulate robot commands.
+Both commands run the integrated hardware pipeline: camera detection → IK →
+UART servo commands on `/dev/ttyAMA0`.
 
-### 4. Using Your iPhone as a Webcam
+### 4. Run Camera-Only Detection
+
+```
+python detect.py --vision-only
+```
+
+- Press `q` to quit.
+- The script will show bounding boxes and print detections without moving the arm.
+
+### 5. Using Your iPhone as a Webcam
 
 - Install an app like EpocCam or iVCam on your iPhone and PC.
 - Change the camera index in `detect.py` from `0` to `1` or `2` if needed.

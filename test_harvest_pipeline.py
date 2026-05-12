@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -227,6 +228,16 @@ class HarvestPipelineTest(unittest.TestCase):
 
         self.assertEqual(len(harvest_calls), 1)
         self.assertAlmostEqual(harvest_calls[0]["z"], 10.0)
+
+    def test_main_defaults_to_hardware_mode(self):
+        with mock.patch.object(sys, "argv", ["main.py"]), \
+                mock.patch.object(main, "run_harvesting") as run_harvesting:
+            main.main()
+
+        run_harvesting.assert_called_once_with(
+            sim_mode=False,
+            confirm_seconds=main.CONFIRM_SECONDS,
+            confirm_frames=main.CONFIRM_FRAMES)
 
 
 if __name__ == "__main__":

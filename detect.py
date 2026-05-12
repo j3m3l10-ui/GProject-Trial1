@@ -1,8 +1,12 @@
 """
 Ripe-Tomato Detection — Agricultural Harvesting Robot
 ======================================================
-Detects only ripe tomatoes and outputs structured 3-D coordinates
-(x, y, z in cm) for the robotic-arm controller.
+Hardware-first entry point for the tomato harvester.
+
+By default, `python detect.py` runs the integrated hardware pipeline from
+`main.py`: camera detection → IK → real UART servo commands. Use
+`python detect.py --vision-only` only when you want the old camera-only debug
+view that prints detections without moving the arm.
 
 False-positive rejection pipeline (applied after YOLO inference):
   1. High confidence threshold (default 0.70)
@@ -16,6 +20,16 @@ Coordinate frame:
   - Y_cm : positive → down
   - Z_cm : depth estimated via pinhole model (requires FOCAL_LENGTH calibration)
 """
+
+import sys
+
+if __name__ == "__main__" and "--vision-only" not in sys.argv:
+    from main import main as run_integrated_harvester
+    run_integrated_harvester()
+    raise SystemExit
+
+if "--vision-only" in sys.argv:
+    sys.argv.remove("--vision-only")
 
 import cv2
 import json
