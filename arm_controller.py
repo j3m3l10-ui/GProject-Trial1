@@ -37,6 +37,10 @@ PULSE_PER_RAD = 240.0
 DEFAULT_LINKS = [0.072, 0.104, 0.096, 0.046, 0.070]
 #                base↑  shoulder  elbow   wrist   tool/gripper
 
+# Harvest geometry (metres)
+DEFAULT_STEM_DIRECTION = np.array([0.0, 0.0, 1.0], dtype=float)
+CUT_GAP_M = 0.01
+
 
 def rodrigues(axis, theta):
     """Rotation matrix via Rodrigues (quaternion shortcut)."""
@@ -198,15 +202,20 @@ def search_home_angles():
 
 # ── Cut-point computation ──────────────────────────────────────────────────────
 
-def compute_cut_point(tomato_center_m, tomato_radius_m, arm_base):
+def compute_cut_point(tomato_center_m, tomato_radius_m, arm_base=None,
+                      stem_direction=None):
     """
     Given tomato position in arm-frame (metres), compute the point
-    1 cm above the tomato surface along the stem (world +Z axis).
+    1 cm above the tomato surface along the stem direction.
     Returns (edge_point, cut_point) both as numpy arrays.
     """
     center = np.array(tomato_center_m, dtype=float)
-    stem_direction = np.array([0.0, 0.0, 1.0])  # stems grow upward (+Z)
-    edge_point = center + stem_direction * tomato_radius_m
-    cut_gap = 0.01  # 1 cm above the surface
-    cut_point = center + stem_direction * (tomato_radius_m + cut_gap)
+    direction = DEFAULT_STEM_DIRECTION if stem_direction is None else stem_direction
+    direction = np.array(direction, dtype=float)
+    norm = np.linalg.norm(direction)
+    if norm <= 1e-9:
+        raise ValueError("stem_direction must be non-zero")
+    direction = direction / norm
+    edge_point = center + direction * tomato_radius_m
+    cut_point = center + direction * (tomato_radius_m + CUT_GAP_M)
     return edge_point, cut_point

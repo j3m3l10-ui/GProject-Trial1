@@ -46,11 +46,15 @@ logger = logging.getLogger(__name__)
 # ── Configuration ──────────────────────────────────────────────────────────────
 CONFIRM_SECONDS    = 5.0     # seconds a tomato must be visible before acting
 CONFIRM_FRAMES     = 8       # minimum detections within the confirm window
+CONFIRM_POSITION_TOLERANCE_CM = 6.0  # restart confirmation if target jumps
 MOVE_DURATION_MS   = 800     # servo move duration for arm motion
 GRIPPER_DELAY_S    = 0.6     # wait after gripper command
 RETRACT_DELAY_S    = 1.0     # wait after retract before next scan
 TOMATO_RADIUS_M    = 0.035   # average tomato radius in metres
 CAMERA_INDEX       = 0       # default camera
+IK_TOLERANCE_M     = 5e-4    # cutter target must solve to sub-millimetre error
+IK_MAX_ERROR_M     = 0.005   # never cut with more than 5 mm residual error
+STEM_DIRECTION_ARM_FRAME = np.array([0.0, 0.0, 1.0], dtype=float)
 
 # ── Camera-to-arm transform ───────────────────────────────────────────────────
 # Because our camera is Hand-in-Eye (mounted on the wrist), the detected
@@ -73,6 +77,41 @@ def camera_to_arm_frame(xyz_cm_dict):
     arm_y = -cam[0] + CAMERA_OFFSET_M[1]  # left/right
     arm_z = -cam[1] + CAMERA_OFFSET_M[2]  # up/down
     return np.array([arm_x, arm_y, arm_z], dtype=float)
+
+
+def _position_vector_cm(detection):
+    xyz = detection["xyz_cm"]
+    return np.array([xyz["x"], xyz["y"], xyz["z"]], dtype=float)
+
+
+def _buffer_mean_position_cm(confirm_buffer):
+    positions = np.array([_position_vector_cm(d) for _, d in confirm_buffer],
+                         dtype=float)
+    return np.mean(positions, axis=0)
+
+
+def _select_detection_for_confirmation(detections, confirm_buffer,
+                                       tolerance_cm=CONFIRM_POSITION_TOLERANCE_CM):
+    """
+    Keep the confirmation window attached to one physical tomato.
+    Returns (selected_detection, same_target).
+    """
+    if not detections:
+        return None, False
+
+    if not confirm_buffer:
+        return max(detections, key=lambda d: d["confidence"]), True
+
+    reference = _buffer_mean_position_cm(confirm_buffer)
+    selected = min(
+        detections,
+        key=lambda d: np.linalg.norm(_position_vector_cm(d) - reference),
+    )
+    distance_cm = np.linalg.norm(_position_vector_cm(selected) - reference)
+    if distance_cm <= tolerance_cm:
+        return selected, True
+
+    return max(detections, key=lambda d: d["confidence"]), False
 
 
 # ── Trajectory interpolation ──────────────────────────────────────────────────
@@ -126,14 +165,19 @@ def run_harvesting(sim_mode=False):
                 annotated = detector.annotate(frame, detections)
                 now = time.time()
 
-                if detections:
-                    # Pick the highest-confidence detection
-                    best = max(detections, key=lambda d: d["confidence"])
+                # Purge old entries outside the confirm window before matching.
+                confirm_buffer = [(t, d) for t, d in confirm_buffer
+                                  if now - t <= CONFIRM_SECONDS]
 
-                    confirm_buffer.append((now, best))
-                    # Purge old entries outside the confirm window
-                    confirm_buffer = [(t, d) for t, d in confirm_buffer
-                                      if now - t <= CONFIRM_SECONDS]
+                if detections:
+                    best, same_target = _select_detection_for_confirmation(
+                        detections, confirm_buffer)
+
+                    if same_target:
+                        confirm_buffer.append((now, best))
+                    else:
+                        logger.info("Tomato target changed; restarting confirmation.")
+                        confirm_buffer = [(now, best)]
 
                     if state == "SCANNING":
                         state = "CONFIRMING"
@@ -143,10 +187,7 @@ def run_harvesting(sim_mode=False):
                     if (len(confirm_buffer) >= CONFIRM_FRAMES and
                             now - confirm_buffer[0][0] >= CONFIRM_SECONDS):
                         # Average the confirmed position
-                        positions = [d["xyz_cm"] for _, d in confirm_buffer]
-                        avg_x = np.mean([p["x"] for p in positions])
-                        avg_y = np.mean([p["y"] for p in positions])
-                        avg_z = np.mean([p["z"] for p in positions])
+                        avg_x, avg_y, avg_z = _buffer_mean_position_cm(confirm_buffer)
                         locked_xyz_cm = {"x": avg_x, "y": avg_y, "z": avg_z}
 
                         logger.info(f"LOCKED tomato at (cm): "
@@ -205,14 +246,16 @@ def _execute_harvest(arm, driver, locked_xyz_cm, frame):
     target_m = camera_to_arm_frame(locked_xyz_cm)
     logger.info(f"Arm-frame target (m): {target_m}")
 
-    # Check reachability
-    if not arm.is_reachable(target_m):
-        logger.warning("Target is OUT OF REACH — skipping.")
-        return
-
     # Compute cut point (1 cm above tomato surface along stem / +Z)
-    edge_pt, cut_pt = compute_cut_point(target_m, TOMATO_RADIUS_M, arm.base_pos)
+    edge_pt, cut_pt = compute_cut_point(
+        target_m, TOMATO_RADIUS_M, arm.base_pos,
+        stem_direction=STEM_DIRECTION_ARM_FRAME)
     logger.info(f"Cut point (m): {cut_pt}")
+
+    # Check reachability on the actual cutter target, not just the tomato centre.
+    if not arm.is_reachable(cut_pt):
+        logger.warning("Cut point is OUT OF REACH — skipping.")
+        return
 
     # Save current (search-home) joint config
     q_home = arm.joint_angles.copy()
@@ -222,12 +265,13 @@ def _execute_harvest(arm, driver, locked_xyz_cm, frame):
     time.sleep(0.5)
 
     # Solve IK for the cut point
-    solved, err, iters = arm.inverse_kinematics(cut_pt, max_iters=400, tol=5e-4)
+    solved, err, iters = arm.inverse_kinematics(
+        cut_pt, max_iters=500, tol=IK_TOLERANCE_M)
     q_cut = arm.joint_angles.copy()
     logger.info(f"IK solved={solved}, error={err:.4f}m, iters={iters}")
 
-    if not solved and err > 0.02:
-        logger.warning(f"IK error too large ({err:.4f}m) — aborting harvest.")
+    if not solved or err > IK_MAX_ERROR_M:
+        logger.warning(f"IK did not reach the cut point ({err:.4f}m) — aborting harvest.")
         arm.set_joint_angles(q_home)
         return
 

@@ -56,6 +56,14 @@ class TomatoDetector:
             return None
         return (self.real_diameter_cm * self.focal_length_px) / pixel_diameter
 
+    @staticmethod
+    def estimate_bbox_diameter_px(x1, y1, x2, y2):
+        """Estimate the visible tomato diameter from its bounding box."""
+        w, h = x2 - x1, y2 - y1
+        if w <= 0 or h <= 0:
+            return None
+        return (w + h) / 2.0
+
     # ── Filters ────────────────────────────────────────────────────────────────
     def _passes_size_shape(self, x1, y1, x2, y2):
         w, h = x2 - x1, y2 - y1
@@ -103,7 +111,8 @@ class TomatoDetector:
                 continue
 
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            z_cm = self.estimate_depth_cm(x2 - x1)
+            pixel_diameter = self.estimate_bbox_diameter_px(x1, y1, x2, y2)
+            z_cm = self.estimate_depth_cm(pixel_diameter)
             if z_cm is None:
                 continue
 

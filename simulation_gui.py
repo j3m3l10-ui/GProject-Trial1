@@ -37,6 +37,10 @@ from arm_controller import (
 )
 from servo_driver import ServoDriver
 
+IK_TOLERANCE_M = 5e-4
+IK_MAX_ERROR_M = 0.005
+STEM_DIRECTION_ARM_FRAME = np.array([0.0, 0.0, 1.0], dtype=float)
+
 # Try to import vision (may fail if no model weights yet — GUI still works)
 _VISION_AVAILABLE = False
 try:
@@ -279,26 +283,29 @@ class SimulationGUI:
         self.tomato_pos = pos.copy()
         self.tomato_detached = False
 
-        if not self.arm.is_reachable(pos):
+        edge_pt, cut_pt = compute_cut_point(
+            pos, self.tomato_radius, self.arm.base_pos,
+            stem_direction=STEM_DIRECTION_ARM_FRAME)
+
+        if not self.arm.is_reachable(cut_pt):
             messagebox.showwarning("Out of Reach",
-                                   f"Target {pos} is beyond arm reach "
+                                   f"Cut point {cut_pt} is beyond arm reach "
                                    f"({self.arm.max_reach():.3f}m).")
             return
-
-        edge_pt, cut_pt = compute_cut_point(pos, self.tomato_radius, self.arm.base_pos)
 
         # Start from Search Home
         self.arm.set_joint_angles(self.home_angles)
         q_home = self.arm.joint_angles.copy()
 
         # Solve IK for cut point
-        solved, err, iters = self.arm.inverse_kinematics(cut_pt, max_iters=500, tol=5e-4)
+        solved, err, iters = self.arm.inverse_kinematics(
+            cut_pt, max_iters=500, tol=IK_TOLERANCE_M)
         q_cut = self.arm.joint_angles.copy()
 
         self.status_var.set(f"IK: solved={solved}, err={err:.4f}m, iters={iters}\n"
                            f"Cut point: [{cut_pt[0]:.3f}, {cut_pt[1]:.3f}, {cut_pt[2]:.3f}]")
 
-        if not solved and err > 0.02:
+        if not solved or err > IK_MAX_ERROR_M:
             messagebox.showwarning("IK Failed", f"Cannot reach cut point (err={err:.4f}m)")
             return
 
@@ -386,9 +393,12 @@ class SimulationGUI:
             return
         self.tomato_center = pos.copy()
         self.tomato_pos = pos.copy()
-        edge_pt, cut_pt = compute_cut_point(pos, self.tomato_radius, self.arm.base_pos)
+        edge_pt, cut_pt = compute_cut_point(
+            pos, self.tomato_radius, self.arm.base_pos,
+            stem_direction=STEM_DIRECTION_ARM_FRAME)
         self.arm.set_joint_angles(self.home_angles)
-        solved, err, iters = self.arm.inverse_kinematics(cut_pt, max_iters=500, tol=5e-4)
+        solved, err, iters = self.arm.inverse_kinematics(
+            cut_pt, max_iters=500, tol=IK_TOLERANCE_M)
         self.draw_arm(highlight_target=cut_pt)
         self.status_var.set(f"IK: solved={solved}, err={err:.4f}m, iters={iters}\n"
                            f"Arm jumped to cut pose (no animation).")
