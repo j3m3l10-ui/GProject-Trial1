@@ -13,7 +13,10 @@ except ImportError:
 
 import main
 from arm_controller import CUT_GAP_M, FiveDOFArm, compute_cut_point, search_home_angles
-from servo_driver import GRIPPER_OPEN_PULSE
+from servo_driver import (
+    DEFAULT_BAUD, DEFAULT_SERVO_BACKEND, DEFAULT_UART_PORT,
+    GRIPPER_OPEN_PULSE, ServoDriver,
+)
 from vision import TomatoDetector
 
 
@@ -146,6 +149,99 @@ class HarvestPipelineTest(unittest.TestCase):
                             for call in approach_moves))
         self.assertIn(("close", 500), driver.calls)
 
+    def test_harvest_with_sdk_backend_sends_five_hardware_servo_commands(self):
+        board = types.ModuleType("HiwonderSDK.Board")
+        board.setBusServoPulse = mock.Mock()
+        package = types.ModuleType("HiwonderSDK")
+
+        with mock.patch.dict(sys.modules, {
+            "HiwonderSDK": package,
+            "HiwonderSDK.Board": board,
+        }):
+            arm = FiveDOFArm()
+            arm.set_joint_angles(search_home_angles())
+            driver = ServoDriver(mode="real", backend="sdk")
+
+            harvest_ok, reason = main._execute_harvest(
+                arm, driver, {"x": 0.0, "y": 0.0, "z": 10.0}, frame=None)
+
+        approach_calls = [
+            call.args for call in board.setBusServoPulse.call_args_list
+            if call.args[2] == main.MOVE_DURATION_MS // 25
+        ]
+        self.assertTrue(harvest_ok, reason)
+        self.assertEqual(reason, "cut complete")
+        self.assertEqual(driver.backend, "sdk")
+        self.assertEqual(len(approach_calls), 26 * 5)
+        self.assertEqual({args[0] for args in approach_calls[:5]}, {1, 3, 4, 5, 6})
+        self.assertTrue(all(args[1] == GRIPPER_OPEN_PULSE
+                            for args in approach_calls if args[0] == 1))
+        board.setBusServoPulse.assert_any_call(1, GRIPPER_OPEN_PULSE, 400)
+        board.setBusServoPulse.assert_any_call(1, 700, 500)
+
+    def test_uart_backend_writes_one_packet_per_servo(self):
+        writes = []
+
+        class FakeSerial:
+            def __init__(self, port, baud, timeout, parity, stopbits):
+                self.port = port
+                self.baud = baud
+                self.timeout = timeout
+                self.parity = parity
+                self.stopbits = stopbits
+
+            def write(self, packet):
+                writes.append(packet)
+
+            def close(self):
+                pass
+
+        fake_serial = types.SimpleNamespace(
+            Serial=FakeSerial,
+            PARITY_NONE="N",
+            STOPBITS_ONE=1,
+        )
+
+        with mock.patch.dict(sys.modules, {"serial": fake_serial}):
+            driver = ServoDriver(mode="real", backend="uart",
+                                 uart_port="/dev/fake", baud=12345)
+            driver.move_servos({6: 500, 5: 600, 4: 700, 3: 400, 1: 200},
+                               duration_ms=321)
+
+        self.assertEqual(driver.backend, "uart")
+        self.assertEqual(len(writes), 5)
+        self.assertTrue(all(packet.startswith(b"\x55\x55") for packet in writes))
+        self.assertEqual([packet[2] for packet in writes], [6, 5, 4, 3, 1])
+
+    def test_auto_backend_falls_back_to_uart_when_sdk_is_unavailable(self):
+        writes = []
+
+        class FakeSerial:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def write(self, packet):
+                writes.append(packet)
+
+            def close(self):
+                pass
+
+        fake_serial = types.SimpleNamespace(
+            Serial=FakeSerial,
+            PARITY_NONE="N",
+            STOPBITS_ONE=1,
+        )
+
+        with mock.patch("servo_driver.importlib.import_module",
+                        side_effect=ImportError("no sdk")), \
+                mock.patch.dict(sys.modules, {"serial": fake_serial}):
+            driver = ServoDriver(mode="real", backend="auto")
+            driver.move_servo(6, 500, duration_ms=123)
+
+        self.assertEqual(driver.backend, "uart")
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][2], 6)
+
     def test_confirmation_reaches_harvest_with_rolling_buffer(self):
         class Clock:
             def __init__(self):
@@ -240,7 +336,26 @@ class HarvestPipelineTest(unittest.TestCase):
             sim_mode=False,
             confirm_seconds=main.CONFIRM_SECONDS,
             confirm_frames=main.CONFIRM_FRAMES,
-            camera_index=main.CAMERA_INDEX)
+            camera_index=main.CAMERA_INDEX,
+            servo_backend=DEFAULT_SERVO_BACKEND,
+            uart_port=DEFAULT_UART_PORT,
+            baud=DEFAULT_BAUD)
+
+    def test_main_passes_servo_backend_cli_options(self):
+        with mock.patch.object(sys, "argv", [
+                "main.py", "--servo-backend", "sdk", "--uart-port", "/dev/test",
+                "--baud", "57600"]), \
+                mock.patch.object(main, "run_harvesting") as run_harvesting:
+            main.main()
+
+        run_harvesting.assert_called_once_with(
+            sim_mode=False,
+            confirm_seconds=main.CONFIRM_SECONDS,
+            confirm_frames=main.CONFIRM_FRAMES,
+            camera_index=main.CAMERA_INDEX,
+            servo_backend="sdk",
+            uart_port="/dev/test",
+            baud=57600)
 
     def test_camera_auto_open_tries_detected_devices_then_fallbacks(self):
         opened = []

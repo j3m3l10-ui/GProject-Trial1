@@ -13,6 +13,7 @@ Protocol frame:
   CMD 1 = SERVO_MOVE_TIME_WRITE: move servo to position over duration
 """
 
+import importlib
 import time
 import struct
 import logging
@@ -31,6 +32,12 @@ GRIPPER_CLOSE_PULSE = 700
 # ── Default UART settings ─────────────────────────────────────────────────────
 DEFAULT_UART_PORT = "/dev/ttyAMA0"
 DEFAULT_BAUD      = 115200
+DEFAULT_SERVO_BACKEND = "auto"
+SDK_BOARD_MODULES = (
+    "HiwonderSDK.Board",
+    "hiwonder.Board",
+    "Board",
+)
 
 
 def _checksum(buf: bytes) -> int:
@@ -57,35 +64,89 @@ class ServoDriver:
     """Unified servo driver with real/sim backends."""
 
     def __init__(self, mode: str = "sim", uart_port: str = DEFAULT_UART_PORT,
-                 baud: int = DEFAULT_BAUD):
+                 baud: int = DEFAULT_BAUD,
+                 backend: str = DEFAULT_SERVO_BACKEND):
         """
         Args:
             mode: "real" for hardware UART, "sim" for simulation/logging
             uart_port: serial port path (RPi5: /dev/ttyAMA0)
             baud: baud rate
+            backend: "auto", "sdk", or "uart" for real hardware mode
         """
         self.mode = mode.lower()
+        self.backend_requested = backend.lower()
+        self.backend = "sim" if self.mode != "real" else None
         self.serial_conn = None
+        self.board = None
         self.state: Dict[int, int] = {}  # servo_id → current pulse
         self._move_log = []               # history of moves (for GUI playback)
 
         if self.mode == "real":
-            try:
-                import serial
-                self.serial_conn = serial.Serial(
-                    uart_port, baud, timeout=0.5,
-                    parity=serial.PARITY_NONE,
-                    stopbits=serial.STOPBITS_ONE
-                )
-                logger.info(f"[SERVO] Opened {uart_port} @ {baud}")
-            except ImportError:
-                logger.error("[SERVO] pyserial not installed. pip install pyserial")
-                raise
-            except Exception as e:
-                logger.error(f"[SERVO] Cannot open {uart_port}: {e}")
-                raise
+            if self.backend_requested not in ("auto", "sdk", "uart"):
+                raise ValueError("backend must be one of: auto, sdk, uart")
+
+            sdk_error = None
+            if self.backend_requested in ("auto", "sdk"):
+                try:
+                    self._open_sdk_backend()
+                except Exception as e:
+                    sdk_error = e
+                    if self.backend_requested == "sdk":
+                        logger.error(f"[SERVO] Cannot open Hiwonder SDK backend: {e}")
+                        raise
+                    logger.warning(
+                        "[SERVO] Hiwonder SDK backend unavailable (%s); "
+                        "falling back to raw UART.", e)
+
+            if self.backend is None and self.backend_requested in ("auto", "uart"):
+                try:
+                    self._open_uart_backend(uart_port, baud)
+                except Exception:
+                    if sdk_error is not None:
+                        logger.error(
+                            "[SERVO] SDK and raw UART backends both failed.")
+                    raise
         else:
             logger.info("[SERVO] Running in SIMULATION mode")
+
+    def _open_sdk_backend(self):
+        """Use Hiwonder's official Board.setBusServoPulse API."""
+        errors = []
+        for module_name in SDK_BOARD_MODULES:
+            try:
+                board = importlib.import_module(module_name)
+            except ImportError as e:
+                errors.append(f"{module_name}: {e}")
+                continue
+
+            if not hasattr(board, "setBusServoPulse"):
+                errors.append(f"{module_name}: missing setBusServoPulse")
+                continue
+
+            self.board = board
+            self.backend = "sdk"
+            logger.info(f"[SERVO] Using Hiwonder SDK backend: {module_name}")
+            return
+
+        raise ImportError("; ".join(errors) or "no SDK module candidates")
+
+    def _open_uart_backend(self, uart_port: str, baud: int):
+        """Use direct serial bus-servo packets as a fallback backend."""
+        try:
+            import serial
+            self.serial_conn = serial.Serial(
+                uart_port, baud, timeout=0.5,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE
+            )
+            self.backend = "uart"
+            logger.info(f"[SERVO] Opened raw UART backend {uart_port} @ {baud}")
+        except ImportError:
+            logger.error("[SERVO] pyserial not installed. pip install pyserial")
+            raise
+        except Exception as e:
+            logger.error(f"[SERVO] Cannot open raw UART {uart_port}: {e}")
+            raise
 
     # ── Move a single servo ────────────────────────────────────────────────────
     def move_servo(self, servo_id: int, pulse: int, duration_ms: int = 500):
@@ -96,10 +157,13 @@ class ServoDriver:
         self._move_log.append(entry)
         self.state[servo_id] = pulse
 
-        if self.mode == "real" and self.serial_conn:
+        if self.mode == "real" and self.backend == "sdk":
+            self.board.setBusServoPulse(servo_id, pulse, duration_ms)
+            logger.debug(f"[SERVO SDK] ID{servo_id} → {pulse}  ({duration_ms}ms)")
+        elif self.mode == "real" and self.backend == "uart" and self.serial_conn:
             pkt = _build_move_cmd(servo_id, pulse, duration_ms)
             self.serial_conn.write(pkt)
-            logger.debug(f"[SERVO] ID{servo_id} → {pulse}  ({duration_ms}ms)")
+            logger.debug(f"[SERVO UART] ID{servo_id} → {pulse}  ({duration_ms}ms)")
         else:
             logger.debug(f"[SIM] ID{servo_id} → {pulse}  ({duration_ms}ms)")
 

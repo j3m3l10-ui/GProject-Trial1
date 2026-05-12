@@ -37,7 +37,10 @@ from arm_controller import (
     FiveDOFArm, angles_to_pulses, search_home_angles,
     compute_cut_point, SERVO_IDS, SEARCH_HOME_PULSES,
 )
-from servo_driver import ServoDriver, GRIPPER_OPEN_PULSE
+from servo_driver import (
+    DEFAULT_BAUD, DEFAULT_SERVO_BACKEND, DEFAULT_UART_PORT,
+    GRIPPER_OPEN_PULSE, ServoDriver,
+)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -166,16 +169,22 @@ def interpolate_trajectory(q_start, q_end, steps=20):
 # ── Main harvesting loop ──────────────────────────────────────────────────────
 def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
                    confirm_frames=CONFIRM_FRAMES,
-                   camera_index=CAMERA_INDEX):
+                   camera_index=CAMERA_INDEX,
+                   servo_backend=DEFAULT_SERVO_BACKEND,
+                   uart_port=DEFAULT_UART_PORT,
+                   baud=DEFAULT_BAUD):
     mode = "sim" if sim_mode else "real"
     logger.info(f"Starting harvesting system in {mode.upper()} mode")
     if not sim_mode:
-        logger.info("Hardware mode enabled: servo commands will be sent to UART.")
+        logger.info(
+            "Hardware mode enabled: servo backend=%s, uart=%s @ %s",
+            servo_backend, uart_port, baud)
 
     # Initialise subsystems
     detector = TomatoDetector()
     arm = FiveDOFArm()
-    driver = ServoDriver(mode=mode)
+    driver = ServoDriver(mode=mode, backend=servo_backend,
+                         uart_port=uart_port, baud=baud)
 
     # Move to Search Home
     logger.info("Moving arm to Search Home position...")
@@ -394,6 +403,14 @@ def main():
                         help=f"Seconds to confirm a tomato before moving (default: {CONFIRM_SECONDS})")
     parser.add_argument("--confirm-frames", type=int, default=CONFIRM_FRAMES,
                         help=f"Detection frames required before moving (default: {CONFIRM_FRAMES})")
+    parser.add_argument("--servo-backend",
+                        choices=("auto", "sdk", "uart"),
+                        default=DEFAULT_SERVO_BACKEND,
+                        help="Real servo backend: auto tries Hiwonder SDK before raw UART")
+    parser.add_argument("--uart-port", default=DEFAULT_UART_PORT,
+                        help=f"Raw UART serial port (default: {DEFAULT_UART_PORT})")
+    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD,
+                        help=f"Raw UART baud rate (default: {DEFAULT_BAUD})")
     args = parser.parse_args()
     if args.hardware and args.sim:
         parser.error("--hardware and --sim cannot be used together")
@@ -405,7 +422,10 @@ def main():
         run_harvesting(sim_mode=args.sim,
                        confirm_seconds=args.confirm_seconds,
                        confirm_frames=args.confirm_frames,
-                       camera_index=args.camera)
+                       camera_index=args.camera,
+                       servo_backend=args.servo_backend,
+                       uart_port=args.uart_port,
+                       baud=args.baud)
 
 
 if __name__ == "__main__":
