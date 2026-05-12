@@ -25,7 +25,6 @@ The arm must be at Search Home for the camera to see the workspace.
 """
 
 import argparse
-import json
 import logging
 import sys
 import time
@@ -151,7 +150,9 @@ def run_harvesting(sim_mode=False):
 
     # Detection confirmation buffer
     confirm_buffer = []  # list of (timestamp, detection_dict)
+    confirm_started_at = None
     state = "SCANNING"   # SCANNING → CONFIRMING → ACTING → RETRACTING
+    last_status_message = ""
 
     try:
         while True:
@@ -174,18 +175,27 @@ def run_harvesting(sim_mode=False):
                         detections, confirm_buffer)
 
                     if same_target:
+                        if not confirm_buffer:
+                            confirm_started_at = now
                         confirm_buffer.append((now, best))
                     else:
                         logger.info("Tomato target changed; restarting confirmation.")
                         confirm_buffer = [(now, best)]
+                        confirm_started_at = now
 
                     if state == "SCANNING":
                         state = "CONFIRMING"
+                        if confirm_started_at is None:
+                            confirm_started_at = now
                         logger.info(f"Tomato spotted! Confirming for {CONFIRM_SECONDS}s...")
+
+                    confirm_elapsed = (
+                        now - confirm_started_at
+                        if confirm_started_at is not None else 0.0)
 
                     # Check if we have enough consistent detections
                     if (len(confirm_buffer) >= CONFIRM_FRAMES and
-                            now - confirm_buffer[0][0] >= CONFIRM_SECONDS):
+                            confirm_elapsed >= CONFIRM_SECONDS):
                         # Average the confirmed position
                         avg_x, avg_y, avg_z = _buffer_mean_position_cm(confirm_buffer)
                         locked_xyz_cm = {"x": avg_x, "y": avg_y, "z": avg_z}
@@ -195,9 +205,16 @@ def run_harvesting(sim_mode=False):
 
                         state = "ACTING"
                         confirm_buffer.clear()
+                        confirm_started_at = None
 
                         # ── Execute harvest sequence ───────────────────────────
-                        _execute_harvest(arm, driver, locked_xyz_cm, annotated)
+                        harvest_ok, harvest_message = _execute_harvest(
+                            arm, driver, locked_xyz_cm, annotated)
+                        last_status_message = harvest_message
+                        if harvest_ok:
+                            logger.info(f"Harvest result: {harvest_message}")
+                        else:
+                            logger.warning(f"Harvest skipped: {harvest_message}")
 
                         state = "RETRACTING"
                         # Retract to Search Home
@@ -215,13 +232,18 @@ def run_harvesting(sim_mode=False):
                                       if now - t <= CONFIRM_SECONDS]
                     if not confirm_buffer:
                         state = "SCANNING"
+                        confirm_started_at = None
 
                 # Show status on annotated frame
-                status_text = f"State: {state}"
+                status_text = f"Mode: {mode.upper()}  State: {state}"
                 if state == "CONFIRMING":
-                    elapsed = now - confirm_buffer[0][0] if confirm_buffer else 0
+                    elapsed = (
+                        now - confirm_started_at
+                        if confirm_started_at is not None else 0.0)
                     status_text += f"  ({elapsed:.1f}/{CONFIRM_SECONDS}s, " \
                                    f"{len(confirm_buffer)} frames)"
+                if last_status_message:
+                    status_text += f" | {last_status_message[:60]}"
                 cv2.putText(annotated, status_text, (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 cv2.imshow("Tomato Harvester", annotated)
@@ -254,8 +276,12 @@ def _execute_harvest(arm, driver, locked_xyz_cm, frame):
 
     # Check reachability on the actual cutter target, not just the tomato centre.
     if not arm.is_reachable(cut_pt):
-        logger.warning("Cut point is OUT OF REACH — skipping.")
-        return
+        reach = arm.max_reach() if hasattr(arm, "max_reach") else None
+        reason = (
+            f"cut point out of reach: cut={np.round(cut_pt, 3).tolist()}m"
+            + (f", max reach={reach:.3f}m" if reach is not None else ""))
+        logger.warning(reason)
+        return False, reason
 
     # Save current (search-home) joint config
     q_home = arm.joint_angles.copy()
@@ -271,9 +297,12 @@ def _execute_harvest(arm, driver, locked_xyz_cm, frame):
     logger.info(f"IK solved={solved}, error={err:.4f}m, iters={iters}")
 
     if not solved or err > IK_MAX_ERROR_M:
-        logger.warning(f"IK did not reach the cut point ({err:.4f}m) — aborting harvest.")
+        reason = (
+            f"IK failed for cut point: solved={solved}, error={err:.4f}m, "
+            f"limit={IK_MAX_ERROR_M:.4f}m, iterations={iters}")
+        logger.warning(reason)
         arm.set_joint_angles(q_home)
-        return
+        return False, reason
 
     # Move arm along interpolated trajectory: home → cut
     # Exclude gripper (servo ID 1) — it is independently controlled
@@ -297,6 +326,7 @@ def _execute_harvest(arm, driver, locked_xyz_cm, frame):
     # Open gripper to release (tomato falls into net below)
     driver.gripper_open(duration_ms=400)
     time.sleep(0.3)
+    return True, "cut complete"
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
