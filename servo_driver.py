@@ -19,6 +19,7 @@ import sys
 import time
 import struct
 import logging
+from glob import glob
 from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,15 @@ GRIPPER_OPEN_PULSE = 200
 GRIPPER_CLOSE_PULSE = 700
 
 # ── Default UART settings ─────────────────────────────────────────────────────
-DEFAULT_UART_PORT = "/dev/ttyAMA0"
+DEFAULT_UART_PORT = "auto"
+FALLBACK_UART_PORTS = (
+    "/dev/ttyUSB0",
+    "/dev/ttyUSB1",
+    "/dev/ttyACM0",
+    "/dev/ttyACM1",
+    "/dev/ttyAMA0",
+    "/dev/ttyS0",
+)
 DEFAULT_BAUD      = 115200
 DEFAULT_SERVO_BACKEND = "auto"
 SDK_BOARD_MODULES = (
@@ -122,6 +131,29 @@ def _add_sdk_search_paths():
     return paths
 
 
+def _candidate_uart_ports(uart_port: str):
+    """Return UART devices to try. 'auto' means discover common serial names."""
+    if uart_port != "auto":
+        return [uart_port]
+
+    candidates = []
+    for pattern in (
+        "/dev/serial/by-id/*",
+        "/dev/ttyUSB*",
+        "/dev/ttyACM*",
+        "/dev/ttyAMA*",
+        "/dev/ttyS*",
+    ):
+        candidates.extend(sorted(glob(pattern)))
+
+    candidates.extend(FALLBACK_UART_PORTS)
+    unique = []
+    for path in candidates:
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
 class ServoDriver:
     """Unified servo driver with real/sim backends."""
 
@@ -138,6 +170,8 @@ class ServoDriver:
         self.mode = mode.lower()
         self.backend_requested = backend.lower()
         self.backend = "sim" if self.mode != "real" else None
+        self.uart_port = uart_port
+        self.baud = baud
         self.serial_conn = None
         self.board = None
         self.state: Dict[int, int] = {}  # servo_id → current pulse
@@ -197,6 +231,21 @@ class ServoDriver:
 
     def _open_uart_backend(self, uart_port: str, baud: int):
         """Use direct serial bus-servo packets as a fallback backend."""
+        errors = []
+        last_error = None
+        for candidate in _candidate_uart_ports(uart_port):
+            try:
+                self._open_uart_candidate(candidate, baud)
+                self.uart_port = candidate
+                return
+            except Exception as e:
+                errors.append(f"{candidate}: {e}")
+                last_error = e
+
+        raise last_error or RuntimeError(
+            "No UART candidates available: " + "; ".join(errors))
+
+    def _open_uart_candidate(self, uart_port: str, baud: int):
         try:
             import serial
             self.serial_conn = serial.Serial(
@@ -213,6 +262,21 @@ class ServoDriver:
             logger.error(f"[SERVO] Cannot open raw UART {uart_port}: {e}")
             raise
 
+    def _fallback_to_uart_after_sdk_error(self, error):
+        if self.backend_requested != "auto":
+            raise RuntimeError(
+                "Hiwonder SDK servo command failed. If this mentions lgpio "
+                "or .lgd-nfy files, run with --servo-backend auto or uart, "
+                "or fix the Raspberry Pi GPIO/lgpio daemon environment."
+            ) from error
+
+        logger.warning(
+            "[SERVO] SDK command failed at runtime (%s). "
+            "Falling back to raw UART.", error)
+        self.board = None
+        self.backend = None
+        self._open_uart_backend(self.uart_port, self.baud)
+
     # ── Move a single servo ────────────────────────────────────────────────────
     def move_servo(self, servo_id: int, pulse: int, duration_ms: int = 500):
         """Move a single servo to the given pulse over duration_ms."""
@@ -223,8 +287,12 @@ class ServoDriver:
         self.state[servo_id] = pulse
 
         if self.mode == "real" and self.backend == "sdk":
-            self.board.setBusServoPulse(servo_id, pulse, duration_ms)
-            logger.debug(f"[SERVO SDK] ID{servo_id} → {pulse}  ({duration_ms}ms)")
+            try:
+                self.board.setBusServoPulse(servo_id, pulse, duration_ms)
+                logger.debug(f"[SERVO SDK] ID{servo_id} → {pulse}  ({duration_ms}ms)")
+            except Exception as e:
+                self._fallback_to_uart_after_sdk_error(e)
+                self.move_servo(servo_id, pulse, duration_ms)
         elif self.mode == "real" and self.backend == "uart" and self.serial_conn:
             pkt = _build_move_cmd(servo_id, pulse, duration_ms)
             self.serial_conn.write(pkt)

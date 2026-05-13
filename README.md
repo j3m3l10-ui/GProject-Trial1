@@ -81,7 +81,18 @@ If SDK is unavailable and you must use UART, first verify the real UART device:
 
 ```
 ./scripts/list_serial_ports.sh
-python main.py --servo-backend uart --uart-port /dev/ttyAMA0 --servo-self-test-only
+python main.py --servo-backend uart --uart-port auto --servo-self-test-only
+```
+
+If the SDK is found but fails with `.lgd-nfy-*` / `lgpio` errors, the Python
+SDK is trying to use Raspberry Pi GPIO services that are missing on your Debian
+environment. Use the backend auto-fallback or bypass SDK:
+
+```
+chmod +x scripts/check_lgpio_environment.sh
+./scripts/check_lgpio_environment.sh
+python main.py --servo-backend auto --uart-port auto --servo-self-test-only
+python main.py --servo-backend uart --uart-port auto --servo-self-test-only
 ```
 
 Camera auto-detection is enabled by default. If OpenCV still cannot open the

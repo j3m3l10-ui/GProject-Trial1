@@ -357,6 +357,56 @@ class HarvestPipelineTest(unittest.TestCase):
             self.assertEqual(driver.backend, "sdk")
             self.assertEqual(driver.board.calls, [(6, 500, 123)])
 
+    def test_auto_backend_falls_back_when_sdk_command_raises_lgpio_error(self):
+        writes = []
+        board = types.ModuleType("HiwonderSDK.Board")
+        board.setBusServoPulse = mock.Mock(
+            side_effect=FileNotFoundError(".lgd-nfy-3"))
+        package = types.ModuleType("HiwonderSDK")
+
+        class FakeSerial:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def write(self, packet):
+                writes.append(packet)
+
+            def close(self):
+                pass
+
+        fake_serial = types.SimpleNamespace(
+            Serial=FakeSerial,
+            PARITY_NONE="N",
+            STOPBITS_ONE=1,
+        )
+
+        with mock.patch.dict(sys.modules, {
+            "HiwonderSDK": package,
+            "HiwonderSDK.Board": board,
+            "serial": fake_serial,
+        }):
+            driver = ServoDriver(mode="real", backend="auto",
+                                 uart_port="auto")
+            driver.move_servo(6, 500, duration_ms=123)
+
+        self.assertEqual(driver.backend, "uart")
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][2], 6)
+
+    def test_forced_sdk_backend_raises_when_sdk_command_raises_lgpio_error(self):
+        board = types.ModuleType("HiwonderSDK.Board")
+        board.setBusServoPulse = mock.Mock(
+            side_effect=FileNotFoundError(".lgd-nfy-3"))
+        package = types.ModuleType("HiwonderSDK")
+
+        with mock.patch.dict(sys.modules, {
+            "HiwonderSDK": package,
+            "HiwonderSDK.Board": board,
+        }):
+            driver = ServoDriver(mode="real", backend="sdk")
+            with self.assertRaises(RuntimeError):
+                driver.move_servo(6, 500, duration_ms=123)
+
     def test_confirmation_reaches_harvest_with_rolling_buffer(self):
         class Clock:
             def __init__(self):
