@@ -50,13 +50,23 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-CONFIRM_SECONDS    = 1.0     # seconds a tomato must be visible before acting
+CONFIRM_SECONDS    = 3.0     # seconds used for the reference validation snapshot
 CONFIRM_FRAMES     = 3       # minimum detections within the confirm window
 CONFIRM_POSITION_TOLERANCE_CM = 6.0  # restart confirmation if target jumps
 MOVE_DURATION_MS   = 800     # servo move duration for arm motion
+GUIDED_MOVE_DURATION_MS = 180 # short moves for live vision-guided approach
 GRIPPER_DELAY_S    = 0.6     # wait after gripper command
 RETRACT_DELAY_S    = 1.0     # wait after retract before next scan
 TOMATO_RADIUS_M    = 0.035   # average tomato radius in metres
+REFERENCE_TARGET_LIMIT = 3
+VALIDATION_TRACK_TOLERANCE_CM = 5.0
+VALIDATION_MIN_OBSERVATIONS = 2
+GUIDED_APPROACH_MAX_STEPS = 45
+GUIDED_APPROACH_STEP_M = 0.012
+GUIDED_APPROACH_FILL_RATIO = 0.42
+GUIDED_APPROACH_STOP_DEPTH_CM = 10.0
+GUIDED_TARGET_LOST_LIMIT = 8
+GUIDED_CUT_OFFSET_M = 0.01
 CAMERA_INDEX       = -1      # -1 = auto-detect camera
 DEFAULT_CAMERA_SOURCE = "opencv"
 DEFAULT_ROS_IMAGE_TOPIC = "/camera/image_raw"
@@ -304,6 +314,281 @@ def _select_detection_for_confirmation(detections, confirm_buffer,
     return max(detections, key=lambda d: d["confidence"]), False
 
 
+def _detection_diameter_px(detection):
+    x1, y1, x2, y2 = detection["bbox_px"]
+    return max(0.0, ((x2 - x1) + (y2 - y1)) / 2.0)
+
+
+def _detection_fill_ratio(detection, frame_shape):
+    if frame_shape is None or len(frame_shape) < 2:
+        return 0.0
+    frame_h, frame_w = frame_shape[:2]
+    frame_min = max(1, min(frame_w, frame_h))
+    return _detection_diameter_px(detection) / frame_min
+
+
+def _new_validation_track(detection):
+    xyz = _position_vector_cm(detection)
+    return {
+        "count": 1,
+        "xyz_sum": xyz.copy(),
+        "center_sum": np.array(detection["center_px"], dtype=float),
+        "best": detection,
+        "last": detection,
+    }
+
+
+def _add_detection_to_tracks(tracks, detection,
+                             tolerance_cm=VALIDATION_TRACK_TOLERANCE_CM):
+    xyz = _position_vector_cm(detection)
+    if not tracks:
+        tracks.append(_new_validation_track(detection))
+        return
+
+    distances = [
+        np.linalg.norm(xyz - (track["xyz_sum"] / track["count"]))
+        for track in tracks
+    ]
+    nearest_idx = int(np.argmin(distances))
+    if distances[nearest_idx] > tolerance_cm:
+        tracks.append(_new_validation_track(detection))
+        return
+
+    track = tracks[nearest_idx]
+    track["count"] += 1
+    track["xyz_sum"] += xyz
+    track["center_sum"] += np.array(detection["center_px"], dtype=float)
+    track["last"] = detection
+    if detection["confidence"] > track["best"]["confidence"]:
+        track["best"] = detection
+
+
+def _tracks_to_ranked_targets(tracks, max_targets=REFERENCE_TARGET_LIMIT,
+                              min_observations=VALIDATION_MIN_OBSERVATIONS):
+    targets = []
+    for track in tracks:
+        if track["count"] < min_observations:
+            continue
+        xyz = track["xyz_sum"] / track["count"]
+        center = track["center_sum"] / track["count"]
+        best = track["best"]
+        targets.append({
+            "rank": 0,
+            "observations": track["count"],
+            "confidence": best["confidence"],
+            "bbox_px": best["bbox_px"],
+            "center_px": [int(round(center[0])), int(round(center[1]))],
+            "xyz_cm": {
+                "x": float(round(xyz[0], 2)),
+                "y": float(round(xyz[1], 2)),
+                "z": float(round(xyz[2], 2)),
+            },
+            "distance_cm": float(round(xyz[2], 2)),
+        })
+
+    targets.sort(key=lambda target: target["distance_cm"])
+    for rank, target in enumerate(targets[:max_targets], start=1):
+        target["rank"] = rank
+    return targets[:max_targets]
+
+
+def _build_reference_snapshot(detection_samples, arm, captured_at=None,
+                              max_targets=REFERENCE_TARGET_LIMIT,
+                              min_observations=VALIDATION_MIN_OBSERVATIONS):
+    tracks = []
+    for detection in detection_samples:
+        _add_detection_to_tracks(tracks, detection)
+
+    return {
+        "captured_at": captured_at if captured_at is not None else time.time(),
+        "initial_joint_angles": arm.joint_angles.copy(),
+        "initial_pulses": angles_to_pulses(arm.joint_angles),
+        "targets": _tracks_to_ranked_targets(
+            tracks, max_targets=max_targets,
+            min_observations=min_observations),
+    }
+
+
+def _collect_validation_snapshot(cap, detector, arm,
+                                 validation_seconds=CONFIRM_SECONDS,
+                                 min_observations=CONFIRM_FRAMES):
+    """Collect live detections for the validation window and rank closest targets."""
+    logger.info("Starting %.1fs validation snapshot.", validation_seconds)
+    deadline = time.time() + validation_seconds
+    samples = []
+    last_frame = None
+
+    while time.time() < deadline:
+        ret, frame = cap.read()
+        if not ret:
+            logger.warning("Frame grab failed during validation snapshot.")
+            continue
+        last_frame = frame
+        detections = detector.detect(frame)
+        samples.extend(detections)
+
+        annotated = detector.annotate(frame, detections)
+        remaining = max(0.0, deadline - time.time())
+        cv2.putText(annotated, f"Validation snapshot: {remaining:.1f}s",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 255, 255), 2)
+        cv2.imshow("Tomato Harvester", annotated)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    snapshot = _build_reference_snapshot(
+        samples, arm, min_observations=min_observations)
+    logger.info(
+        "Validation snapshot saved: %s target(s), initial pulses=%s",
+        len(snapshot["targets"]), snapshot["initial_pulses"])
+    for target in snapshot["targets"]:
+        logger.info(
+            "Snapshot rank %s: z=%.1fcm center=%s xyz=%s observations=%s",
+            target["rank"], target["distance_cm"], target["center_px"],
+            target["xyz_cm"], target["observations"])
+    return snapshot, last_frame
+
+
+def _select_live_target(detections, reference_target, last_detection=None):
+    if not detections:
+        return None
+
+    anchor = last_detection or reference_target
+    anchor_center = np.array(anchor["center_px"], dtype=float)
+    anchor_xyz = np.array([
+        anchor["xyz_cm"]["x"], anchor["xyz_cm"]["y"], anchor["xyz_cm"]["z"],
+    ], dtype=float)
+
+    def score(detection):
+        center = np.array(detection["center_px"], dtype=float)
+        xyz = _position_vector_cm(detection)
+        center_score = np.linalg.norm(center - anchor_center) / 100.0
+        xyz_score = np.linalg.norm(xyz - anchor_xyz) / 25.0
+        confidence_bonus = detection["confidence"] * 0.2
+        return center_score + xyz_score - confidence_bonus
+
+    return min(detections, key=score)
+
+
+def _solve_and_command_point(arm, driver, target_m,
+                             duration_ms=GUIDED_MOVE_DURATION_MS,
+                             error_limit_m=IK_MAX_ERROR_M):
+    q_before = arm.joint_angles.copy()
+    solved, err, iters = arm.inverse_kinematics(
+        target_m, max_iters=500, tol=IK_TOLERANCE_M)
+    q_target = arm.joint_angles.copy()
+    logger.info("Guided IK solved=%s, error=%.4fm, iters=%s",
+                solved, err, iters)
+    if not solved or err > error_limit_m:
+        arm.set_joint_angles(q_before)
+        return False, f"IK failed: solved={solved}, error={err:.4f}m"
+
+    pulses = angles_to_pulses(q_target)
+    pulses[1] = GRIPPER_OPEN_PULSE
+    driver.move_servos(pulses, duration_ms=duration_ms)
+    time.sleep(duration_ms / 1000.0)
+    return True, "moved"
+
+
+def _guided_harvest_target(arm, driver, detector, cap, reference_target):
+    """Use live detections to slowly approach and cut one ranked target."""
+    logger.info("Guided harvest for snapshot rank %s started.",
+                reference_target["rank"])
+    driver.gripper_open(duration_ms=400)
+    time.sleep(0.3)
+
+    last_detection = None
+    lost_count = 0
+    final_center_m = None
+
+    for step in range(1, GUIDED_APPROACH_MAX_STEPS + 1):
+        ret, frame = cap.read()
+        if not ret:
+            lost_count += 1
+            logger.warning("No frame while guiding rank %s (%s/%s).",
+                           reference_target["rank"], lost_count,
+                           GUIDED_TARGET_LOST_LIMIT)
+            if lost_count >= GUIDED_TARGET_LOST_LIMIT:
+                return False, "target lost: no frames"
+            continue
+
+        detections = detector.detect(frame)
+        target = _select_live_target(detections, reference_target,
+                                     last_detection)
+        annotated = detector.annotate(frame, detections)
+
+        if target is None:
+            lost_count += 1
+            logger.warning("No live target match for rank %s (%s/%s).",
+                           reference_target["rank"], lost_count,
+                           GUIDED_TARGET_LOST_LIMIT)
+            if lost_count >= GUIDED_TARGET_LOST_LIMIT:
+                return False, "target lost: no detections"
+            cv2.imshow("Tomato Harvester", annotated)
+            cv2.waitKey(1)
+            continue
+
+        lost_count = 0
+        last_detection = target
+        fill_ratio = _detection_fill_ratio(target, frame.shape)
+        final_center_m = camera_to_arm_frame(target["xyz_cm"])
+        logger.info(
+            "Guided rank %s step %s: fill=%.2f z=%.1fcm center=%s",
+            reference_target["rank"], step, fill_ratio,
+            target["xyz_cm"]["z"], target["center_px"])
+
+        if (fill_ratio >= GUIDED_APPROACH_FILL_RATIO or
+                target["xyz_cm"]["z"] <= GUIDED_APPROACH_STOP_DEPTH_CM):
+            logger.info("Rank %s close enough for cut (fill=%.2f, z=%.1fcm).",
+                        reference_target["rank"], fill_ratio,
+                        target["xyz_cm"]["z"])
+            cv2.imshow("Tomato Harvester", annotated)
+            cv2.waitKey(1)
+            break
+
+        current_m = arm.end_effector_pos()
+        delta = final_center_m - current_m
+        distance = np.linalg.norm(delta)
+        if distance > GUIDED_APPROACH_STEP_M:
+            next_point_m = current_m + (delta / distance) * GUIDED_APPROACH_STEP_M
+        else:
+            next_point_m = final_center_m
+
+        ok, reason = _solve_and_command_point(arm, driver, next_point_m)
+        if not ok:
+            return False, reason
+
+        cv2.putText(annotated, f"Guiding rank {reference_target['rank']} step {step}",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 255, 255), 2)
+        cv2.imshow("Tomato Harvester", annotated)
+        cv2.waitKey(1)
+    else:
+        logger.warning("Guided approach reached max steps for rank %s.",
+                       reference_target["rank"])
+
+    if final_center_m is None:
+        return False, "no final target center"
+
+    cut_point_m = final_center_m + (
+        STEM_DIRECTION_ARM_FRAME / np.linalg.norm(STEM_DIRECTION_ARM_FRAME)
+    ) * GUIDED_CUT_OFFSET_M
+    logger.info("Rank %s cut point 1cm above live center: %s",
+                reference_target["rank"], np.round(cut_point_m, 4))
+
+    ok, reason = _solve_and_command_point(
+        arm, driver, cut_point_m, duration_ms=MOVE_DURATION_MS)
+    if not ok:
+        return False, reason
+
+    logger.info("CUTTING rank %s — closing gripper.", reference_target["rank"])
+    driver.gripper_close(duration_ms=500)
+    time.sleep(GRIPPER_DELAY_S)
+    driver.gripper_open(duration_ms=400)
+    time.sleep(0.2)
+    return True, f"rank {reference_target['rank']} harvested"
+
+
 # ── Trajectory interpolation ──────────────────────────────────────────────────
 def interpolate_trajectory(q_start, q_end, steps=20):
     """Linear joint-space interpolation."""
@@ -356,9 +641,6 @@ def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
         driver.close()
         return
 
-    # Detection confirmation buffer
-    confirm_buffer = []  # list of (timestamp, detection_dict)
-    confirm_started_at = None
     state = "SCANNING"   # SCANNING → CONFIRMING → ACTING → RETRACTING
     last_status_message = ""
     frame_grab_failures = 0
@@ -380,8 +662,6 @@ def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
                         camera_index=camera_index,
                         ros_image_topic=ros_image_topic,
                         ros_frame_timeout=ros_frame_timeout)
-                    confirm_buffer.clear()
-                    confirm_started_at = None
                     state = "SCANNING"
                     frame_grab_failures = 0
                     if cap is None:
@@ -392,86 +672,52 @@ def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
             if state in ("SCANNING", "CONFIRMING"):
                 detections = detector.detect(frame)
                 annotated = detector.annotate(frame, detections)
-                now = time.time()
-
-                # Purge old entries outside the confirm window before matching.
-                confirm_buffer = [(t, d) for t, d in confirm_buffer
-                                  if now - t <= confirm_seconds]
 
                 if detections:
-                    best, same_target = _select_detection_for_confirmation(
-                        detections, confirm_buffer)
+                    state = "CONFIRMING"
+                    logger.info(
+                        "Tomato detected; collecting %.1fs validation snapshot.",
+                        confirm_seconds)
+                    snapshot, _last_frame = _collect_validation_snapshot(
+                        cap, detector, arm,
+                        validation_seconds=confirm_seconds,
+                        min_observations=confirm_frames)
+                    if not snapshot["targets"]:
+                        logger.warning(
+                            "Validation snapshot did not confirm any stable "
+                            "targets; continuing live scan.")
+                        state = "SCANNING"
+                        continue
 
-                    if same_target:
-                        if not confirm_buffer:
-                            confirm_started_at = now
-                        confirm_buffer.append((now, best))
-                    else:
-                        logger.info("Tomato target changed; restarting confirmation.")
-                        confirm_buffer = [(now, best)]
-                        confirm_started_at = now
-
-                    if state == "SCANNING":
-                        state = "CONFIRMING"
-                        if confirm_started_at is None:
-                            confirm_started_at = now
-                        logger.info(f"Tomato spotted! Confirming for {confirm_seconds}s...")
-
-                    confirm_elapsed = (
-                        now - confirm_started_at
-                        if confirm_started_at is not None else 0.0)
-
-                    # Check if we have enough consistent detections
-                    if (len(confirm_buffer) >= confirm_frames and
-                            confirm_elapsed >= confirm_seconds):
-                        # Average the confirmed position
-                        avg_x, avg_y, avg_z = _buffer_mean_position_cm(confirm_buffer)
-                        locked_xyz_cm = {"x": avg_x, "y": avg_y, "z": avg_z}
-
-                        logger.info(f"LOCKED tomato at (cm): "
-                                    f"X={avg_x:.1f} Y={avg_y:.1f} Z={avg_z:.1f}")
-
-                        state = "ACTING"
-                        confirm_buffer.clear()
-                        confirm_started_at = None
-
-                        # ── Execute harvest sequence ───────────────────────────
-                        harvest_ok, harvest_message = _execute_harvest(
-                            arm, driver, locked_xyz_cm, annotated)
+                    state = "ACTING"
+                    logger.info(
+                        "Reference snapshot saved with %s target(s). "
+                        "Harvesting by distance rank.",
+                        len(snapshot["targets"]))
+                    for target in snapshot["targets"]:
+                        harvest_ok, harvest_message = _guided_harvest_target(
+                            arm, driver, detector, cap, target)
                         last_status_message = harvest_message
                         if harvest_ok:
-                            logger.info(f"Harvest result: {harvest_message}")
+                            logger.info("Harvest result: %s", harvest_message)
                         else:
-                            logger.warning(f"Harvest skipped: {harvest_message}")
+                            logger.warning("Harvest skipped: %s",
+                                           harvest_message)
 
-                        state = "RETRACTING"
-                        # Retract to Search Home
-                        logger.info("Retracting to Search Home...")
-                        arm.set_joint_angles(home_angles)
-                        pulses = angles_to_pulses(home_angles)
-                        driver.move_servos(pulses, duration_ms=1000)
-                        time.sleep(RETRACT_DELAY_S)
+                    state = "RETRACTING"
+                    logger.info("Returning to Search Home after ranked targets.")
+                    arm.set_joint_angles(home_angles)
+                    pulses = angles_to_pulses(home_angles)
+                    driver.move_servos(pulses, duration_ms=1000)
+                    time.sleep(RETRACT_DELAY_S)
 
-                        state = "SCANNING"
-                        logger.info("Ready for next tomato.\n")
-                else:
-                    # No detection this frame — decay buffer
-                    confirm_buffer = [(t, d) for t, d in confirm_buffer
-                                      if now - t <= confirm_seconds]
-                    if not confirm_buffer:
-                        state = "SCANNING"
-                        confirm_started_at = None
+                    state = "SCANNING"
+                    logger.info("Ready for next validation snapshot.\n")
 
                 # Show status on annotated frame
                 status_text = (
                     f"Mode: {mode.upper()}  Camera: {selected_camera}  "
                     f"State: {state}")
-                if state == "CONFIRMING":
-                    elapsed = (
-                        now - confirm_started_at
-                        if confirm_started_at is not None else 0.0)
-                    status_text += f"  ({elapsed:.1f}/{confirm_seconds}s, " \
-                                   f"{len(confirm_buffer)} frames)"
                 if last_status_message:
                     status_text += f" | {last_status_message[:60]}"
                 cv2.putText(annotated, status_text, (10, 30),

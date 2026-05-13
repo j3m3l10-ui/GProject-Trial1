@@ -99,6 +99,68 @@ class HarvestPipelineTest(unittest.TestCase):
     def test_depth_uses_bbox_diameter_estimate(self):
         self.assertEqual(TomatoDetector.estimate_bbox_diameter_px(10, 20, 50, 80), 50.0)
 
+    def test_reference_snapshot_ranks_three_closest_targets(self):
+        arm = FiveDOFArm()
+        arm.set_joint_angles(search_home_angles())
+        samples = [
+            detection(0.0, 0.0, 40.0, confidence=0.7),
+            detection(0.5, 0.0, 40.5, confidence=0.8),
+            detection(2.0, 0.0, 25.0, confidence=0.9),
+            detection(2.5, 0.0, 24.5, confidence=0.8),
+            detection(-2.0, 0.0, 30.0, confidence=0.85),
+            detection(-2.5, 0.0, 30.5, confidence=0.8),
+            detection(6.0, 0.0, 18.0, confidence=0.75),
+            detection(6.5, 0.0, 18.5, confidence=0.8),
+        ]
+        for i, sample in enumerate(samples):
+            sample["bbox_px"] = [10 + i, 20, 50 + i, 60]
+            sample["center_px"] = [30 + i, 40]
+
+        snapshot = main._build_reference_snapshot(samples, arm, captured_at=123.0)
+
+        self.assertEqual(snapshot["captured_at"], 123.0)
+        self.assertEqual(len(snapshot["targets"]), 3)
+        self.assertEqual([target["rank"] for target in snapshot["targets"]], [1, 2, 3])
+        self.assertEqual([target["distance_cm"] for target in snapshot["targets"]],
+                         [18.25, 24.75, 30.25])
+        np.testing.assert_allclose(snapshot["initial_joint_angles"],
+                                   search_home_angles())
+
+    def test_guided_harvest_cuts_one_centimetre_above_live_center(self):
+        class FakeDetector:
+            def detect(self, _frame):
+                det = detection(0.0, 0.0, 10.0, confidence=0.95)
+                det["bbox_px"] = [10, 10, 210, 210]
+                det["center_px"] = [110, 110]
+                return [det]
+
+            def annotate(self, frame, _detections):
+                return frame.copy()
+
+        class FakeCapture:
+            def read(self):
+                return True, np.zeros((240, 240, 3), dtype=np.uint8)
+
+        arm = FakeArm(reachable=True, ik_result=(True, 0.0, 1))
+        driver = FakeDriver()
+        reference = detection(0.0, 0.0, 10.0, confidence=0.95)
+        reference.update({
+            "rank": 1,
+            "bbox_px": [10, 10, 210, 210],
+            "center_px": [110, 110],
+        })
+
+        with mock.patch.object(main.cv2, "imshow"), \
+                mock.patch.object(main.cv2, "waitKey", return_value=-1):
+            harvest_ok, reason = main._guided_harvest_target(
+                arm, driver, FakeDetector(), FakeCapture(), reference)
+
+        expected_center = main.camera_to_arm_frame({"x": 0.0, "y": 0.0, "z": 10.0})
+        expected_cut = expected_center + np.array([0.0, 0.0, main.GUIDED_CUT_OFFSET_M])
+        self.assertTrue(harvest_ok, reason)
+        np.testing.assert_allclose(arm.ik_target, expected_cut)
+        self.assertIn(("close", 500), driver.calls)
+
     def test_harvest_reachability_uses_cut_point(self):
         arm = FakeArm(reachable=False)
         driver = FakeDriver()
@@ -283,6 +345,20 @@ class HarvestPipelineTest(unittest.TestCase):
         clock = Clock()
         wait_calls = {"count": 0}
         harvest_calls = []
+        snapshot = {
+            "captured_at": 0.0,
+            "initial_joint_angles": np.zeros(5),
+            "initial_pulses": {},
+            "targets": [{
+                "rank": 1,
+                "observations": 3,
+                "confidence": 0.9,
+                "bbox_px": [100, 100, 180, 180],
+                "center_px": [140, 140],
+                "xyz_cm": {"x": 0.0, "y": 0.0, "z": 10.0},
+                "distance_cm": 10.0,
+            }],
+        }
         originals = (
             main.TomatoDetector,
             main.cv2.VideoCapture,
@@ -291,7 +367,8 @@ class HarvestPipelineTest(unittest.TestCase):
             main.cv2.destroyAllWindows,
             main.time.time,
             main.time.sleep,
-            main._execute_harvest,
+            main._collect_validation_snapshot,
+            main._guided_harvest_target,
         )
 
         def fake_wait_key(_delay):
@@ -300,8 +377,14 @@ class HarvestPipelineTest(unittest.TestCase):
                 return ord("q")
             return ord("q") if wait_calls["count"] >= 35 else -1
 
-        def fake_execute(_arm, _driver, locked_xyz_cm, _frame):
-            harvest_calls.append(dict(locked_xyz_cm))
+        def fake_collect(_cap, _detector, _arm, validation_seconds,
+                         min_observations):
+            self.assertEqual(validation_seconds, main.CONFIRM_SECONDS)
+            self.assertEqual(min_observations, main.CONFIRM_FRAMES)
+            return snapshot, np.zeros((480, 640, 3), dtype=np.uint8)
+
+        def fake_guided(_arm, _driver, _detector, _cap, target):
+            harvest_calls.append(dict(target))
             return True, "test harvest"
 
         try:
@@ -312,7 +395,8 @@ class HarvestPipelineTest(unittest.TestCase):
             main.cv2.destroyAllWindows = lambda: None
             main.time.time = clock.time
             main.time.sleep = clock.sleep
-            main._execute_harvest = fake_execute
+            main._collect_validation_snapshot = fake_collect
+            main._guided_harvest_target = fake_guided
 
             main.run_harvesting(sim_mode=True)
         finally:
@@ -324,11 +408,12 @@ class HarvestPipelineTest(unittest.TestCase):
                 main.cv2.destroyAllWindows,
                 main.time.time,
                 main.time.sleep,
-                main._execute_harvest,
+                main._collect_validation_snapshot,
+                main._guided_harvest_target,
             ) = originals
 
         self.assertEqual(len(harvest_calls), 1)
-        self.assertAlmostEqual(harvest_calls[0]["z"], 10.0)
+        self.assertEqual(harvest_calls[0]["rank"], 1)
 
     def test_main_defaults_to_hardware_mode(self):
         with mock.patch.object(sys, "argv", ["main.py"]), \
