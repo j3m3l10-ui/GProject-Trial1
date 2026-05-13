@@ -42,7 +42,7 @@ from arm_controller import (
 )
 from servo_driver import (
     DEFAULT_BAUD, DEFAULT_SERVO_BACKEND, DEFAULT_UART_PORT,
-    GRIPPER_OPEN_PULSE, ServoDriver,
+    GRIPPER_CLOSE_PULSE, GRIPPER_OPEN_PULSE, ServoDriver,
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -70,6 +70,8 @@ GUIDED_APPROACH_STOP_DEPTH_CM = 10.0
 GUIDED_TARGET_LOST_LIMIT = 8
 GUIDED_CUT_OFFSET_M = 0.01
 GUIDED_CENTER_TOLERANCE_RATIO = 0.08
+SERVO_SELF_TEST_OFFSET = 25
+SERVO_SELF_TEST_DURATION_MS = 700
 CAMERA_INDEX       = -1      # -1 = auto-detect camera
 DEFAULT_CAMERA_SOURCE = "opencv"
 DEFAULT_ROS_IMAGE_TOPIC = "/camera/image_raw"
@@ -488,9 +490,41 @@ def _solve_and_command_point(arm, driver, target_m,
 
     pulses = angles_to_pulses(q_target)
     pulses[1] = GRIPPER_OPEN_PULSE
+    logger.info("Commanding IK target %s with pulses=%s",
+                np.round(target_m, 4).tolist(), pulses)
     driver.move_servos(pulses, duration_ms=duration_ms)
     time.sleep(duration_ms / 1000.0)
     return True, "moved"
+
+
+def _run_servo_self_test(driver):
+    """
+    Run a small hardware-only movement to prove the servo backend works.
+    This does not depend on camera, YOLO, or IK.
+    """
+    logger.info("Running servo self-test. Watch for gripper and base movement.")
+    home = dict(SEARCH_HOME_PULSES)
+    driver.move_servos(home, duration_ms=SERVO_SELF_TEST_DURATION_MS)
+    time.sleep(SERVO_SELF_TEST_DURATION_MS / 1000.0)
+
+    driver.gripper_open(duration_ms=SERVO_SELF_TEST_DURATION_MS)
+    time.sleep(SERVO_SELF_TEST_DURATION_MS / 1000.0)
+    driver.gripper_close(duration_ms=SERVO_SELF_TEST_DURATION_MS)
+    time.sleep(SERVO_SELF_TEST_DURATION_MS / 1000.0)
+    driver.gripper_open(duration_ms=SERVO_SELF_TEST_DURATION_MS)
+    time.sleep(SERVO_SELF_TEST_DURATION_MS / 1000.0)
+
+    left = dict(home)
+    left[6] = max(0, home[6] - SERVO_SELF_TEST_OFFSET)
+    right = dict(home)
+    right[6] = min(1000, home[6] + SERVO_SELF_TEST_OFFSET)
+    driver.move_servos(left, duration_ms=SERVO_SELF_TEST_DURATION_MS)
+    time.sleep(SERVO_SELF_TEST_DURATION_MS / 1000.0)
+    driver.move_servos(right, duration_ms=SERVO_SELF_TEST_DURATION_MS)
+    time.sleep(SERVO_SELF_TEST_DURATION_MS / 1000.0)
+    driver.move_servos(home, duration_ms=SERVO_SELF_TEST_DURATION_MS)
+    time.sleep(SERVO_SELF_TEST_DURATION_MS / 1000.0)
+    logger.info("Servo self-test complete.")
 
 
 def _visual_servo_target_point(arm, detection, frame_shape):
@@ -651,7 +685,8 @@ def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
                    ros_frame_timeout=ROS_FRAME_TIMEOUT_S,
                    servo_backend=DEFAULT_SERVO_BACKEND,
                    uart_port=DEFAULT_UART_PORT,
-                   baud=DEFAULT_BAUD):
+                   baud=DEFAULT_BAUD,
+                   servo_self_test=False):
     mode = "sim" if sim_mode else "real"
     logger.info(f"Starting harvesting system in {mode.upper()} mode")
     if not sim_mode:
@@ -664,6 +699,8 @@ def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
     arm = FiveDOFArm()
     driver = ServoDriver(mode=mode, backend=servo_backend,
                          uart_port=uart_port, baud=baud)
+    if not sim_mode and servo_self_test:
+        _run_servo_self_test(driver)
 
     # Move to Search Home
     logger.info("Moving arm to Search Home position...")
@@ -884,6 +921,10 @@ def main():
                         help=f"Raw UART serial port (default: {DEFAULT_UART_PORT})")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD,
                         help=f"Raw UART baud rate (default: {DEFAULT_BAUD})")
+    parser.add_argument("--servo-self-test", action="store_true",
+                        help="Run a small safe servo movement before harvesting")
+    parser.add_argument("--servo-self-test-only", action="store_true",
+                        help="Run servo self-test and exit without starting camera")
     args = parser.parse_args()
     if args.hardware and args.sim:
         parser.error("--hardware and --sim cannot be used together")
@@ -891,6 +932,16 @@ def main():
     if args.gui:
         from simulation_gui import launch_gui
         launch_gui()
+    elif args.servo_self_test_only:
+        driver = ServoDriver(
+            mode="sim" if args.sim else "real",
+            backend=args.servo_backend,
+            uart_port=args.uart_port,
+            baud=args.baud)
+        try:
+            _run_servo_self_test(driver)
+        finally:
+            driver.close()
     else:
         run_harvesting(sim_mode=args.sim,
                        confirm_seconds=args.confirm_seconds,
@@ -901,7 +952,8 @@ def main():
                        ros_frame_timeout=args.ros_frame_timeout,
                        servo_backend=args.servo_backend,
                        uart_port=args.uart_port,
-                       baud=args.baud)
+                       baud=args.baud,
+                       servo_self_test=args.servo_self_test)
 
 
 if __name__ == "__main__":

@@ -170,6 +170,10 @@ class ServoDriver:
     # ── Move multiple servos simultaneously ────────────────────────────────────
     def move_servos(self, pulses: Dict[int, int], duration_ms: int = 500):
         """Move multiple servos at once. pulses = {servo_id: pulse_value}."""
+        if self.mode == "real":
+            logger.info(
+                "[SERVO] Commanding backend=%s duration=%sms pulses=%s",
+                self.backend, duration_ms, dict(pulses))
         for sid, pulse in pulses.items():
             self.move_servo(sid, pulse, duration_ms)
 

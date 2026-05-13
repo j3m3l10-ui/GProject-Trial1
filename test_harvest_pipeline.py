@@ -177,6 +177,18 @@ class HarvestPipelineTest(unittest.TestCase):
         self.assertLess(delta[1], 0.0)      # image right maps to arm -Y
         self.assertLess(delta[2], 0.0)      # image down maps to arm -Z
 
+    def test_servo_self_test_commands_gripper_and_base(self):
+        driver = FakeDriver()
+
+        main._run_servo_self_test(driver)
+
+        move_calls = [call for call in driver.calls if call[0] == "move"]
+        self.assertGreaterEqual(len(move_calls), 3)
+        self.assertIn(("open", main.SERVO_SELF_TEST_DURATION_MS), driver.calls)
+        self.assertIn(("close", main.SERVO_SELF_TEST_DURATION_MS), driver.calls)
+        self.assertTrue(any(call[1][6] != main.SEARCH_HOME_PULSES[6]
+                            for call in move_calls))
+
     def test_harvest_reachability_uses_cut_point(self):
         arm = FakeArm(reachable=False)
         driver = FakeDriver()
@@ -446,7 +458,8 @@ class HarvestPipelineTest(unittest.TestCase):
             ros_frame_timeout=main.ROS_FRAME_TIMEOUT_S,
             servo_backend=DEFAULT_SERVO_BACKEND,
             uart_port=DEFAULT_UART_PORT,
-            baud=DEFAULT_BAUD)
+            baud=DEFAULT_BAUD,
+            servo_self_test=False)
 
     def test_main_passes_servo_backend_cli_options(self):
         with mock.patch.object(sys, "argv", [
@@ -467,7 +480,8 @@ class HarvestPipelineTest(unittest.TestCase):
             ros_frame_timeout=2.5,
             servo_backend="sdk",
             uart_port="/dev/test",
-            baud=57600)
+            baud=57600,
+            servo_self_test=False)
 
     def test_ros_camera_source_reads_image_topic_frame(self):
         frame = np.ones((3, 4, 3), dtype=np.uint8)
