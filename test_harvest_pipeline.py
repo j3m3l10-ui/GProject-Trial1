@@ -1,4 +1,6 @@
+import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -331,6 +333,29 @@ class HarvestPipelineTest(unittest.TestCase):
         self.assertEqual(driver.backend, "uart")
         self.assertEqual(len(writes), 1)
         self.assertEqual(writes[0][2], 6)
+
+    def test_sdk_backend_discovers_env_sdk_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package_dir = os.path.join(tmp, "HiwonderSDK")
+            os.makedirs(package_dir)
+            with open(os.path.join(package_dir, "__init__.py"), "w",
+                      encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(package_dir, "Board.py"), "w",
+                      encoding="utf-8") as f:
+                f.write("calls = []\n")
+                f.write("def setBusServoPulse(servo_id, pulse, duration_ms):\n")
+                f.write("    calls.append((servo_id, pulse, duration_ms))\n")
+
+            for module_name in ["HiwonderSDK", "HiwonderSDK.Board"]:
+                sys.modules.pop(module_name, None)
+
+            with mock.patch.dict(os.environ, {"HIWONDER_SDK_PATH": tmp}):
+                driver = ServoDriver(mode="real", backend="sdk")
+                driver.move_servo(6, 500, duration_ms=123)
+
+            self.assertEqual(driver.backend, "sdk")
+            self.assertEqual(driver.board.calls, [(6, 500, 123)])
 
     def test_confirmation_reaches_harvest_with_rolling_buffer(self):
         class Clock:

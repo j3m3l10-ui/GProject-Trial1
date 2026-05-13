@@ -14,6 +14,8 @@ Protocol frame:
 """
 
 import importlib
+import os
+import sys
 import time
 import struct
 import logging
@@ -38,6 +40,21 @@ SDK_BOARD_MODULES = (
     "hiwonder.Board",
     "Board",
 )
+SDK_ENV_VAR = "HIWONDER_SDK_PATH"
+SDK_SEARCH_ROOTS = (
+    ".",
+    "/home/pi",
+    "/home/pi/ArmPi",
+    "/home/pi/ArmPi/HiwonderSDK",
+    "/home/pi/ArmPi/hiwonder",
+    "/home/ubuntu",
+    "/home/ubuntu/ArmPi",
+    "/home/ubuntu/ArmPi/HiwonderSDK",
+    "/home/ubuntu/ArmPi/hiwonder",
+    "/home/hiwonder",
+    "/home/hiwonder/ArmPi",
+    "/home/hiwonder/ArmPi/HiwonderSDK",
+)
 
 
 def _checksum(buf: bytes) -> int:
@@ -58,6 +75,51 @@ def _build_move_cmd(servo_id: int, position: int, duration_ms: int) -> bytes:
     pkt.extend(struct.pack('<HH', position, duration_ms))
     pkt.append(_checksum(pkt))
     return bytes(pkt)
+
+
+def _candidate_sdk_paths():
+    """Return sys.path candidates for common Hiwonder SDK layouts."""
+    roots = []
+    env_value = os.environ.get(SDK_ENV_VAR, "")
+    roots.extend([p for p in env_value.split(os.pathsep) if p])
+    roots.extend(SDK_SEARCH_ROOTS)
+
+    candidates = []
+    for root in roots:
+        root = os.path.abspath(os.path.expanduser(root))
+        if not os.path.exists(root):
+            continue
+
+        checks = (
+            root,
+            os.path.dirname(root),
+            os.path.join(root, "HiwonderSDK"),
+            os.path.join(root, "hiwonder"),
+        )
+        for path in checks:
+            if not path or not os.path.isdir(path):
+                continue
+            parent = os.path.dirname(path)
+            if os.path.exists(os.path.join(path, "Board.py")):
+                candidates.extend([path, parent])
+            if os.path.exists(os.path.join(path, "HiwonderSDK", "Board.py")):
+                candidates.append(path)
+            if os.path.exists(os.path.join(path, "hiwonder", "Board.py")):
+                candidates.append(path)
+
+    unique = []
+    for path in candidates:
+        if path and path not in unique:
+            unique.append(path)
+    return unique
+
+
+def _add_sdk_search_paths():
+    paths = _candidate_sdk_paths()
+    for path in reversed(paths):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    return paths
 
 
 class ServoDriver:
@@ -112,6 +174,7 @@ class ServoDriver:
     def _open_sdk_backend(self):
         """Use Hiwonder's official Board.setBusServoPulse API."""
         errors = []
+        sdk_paths = _add_sdk_search_paths()
         for module_name in SDK_BOARD_MODULES:
             try:
                 board = importlib.import_module(module_name)
@@ -128,7 +191,9 @@ class ServoDriver:
             logger.info(f"[SERVO] Using Hiwonder SDK backend: {module_name}")
             return
 
-        raise ImportError("; ".join(errors) or "no SDK module candidates")
+        searched = f"; searched paths={sdk_paths}" if sdk_paths else ""
+        raise ImportError(
+            ("; ".join(errors) or "no SDK module candidates") + searched)
 
     def _open_uart_backend(self, uart_port: str, baud: int):
         """Use direct serial bus-servo packets as a fallback backend."""

@@ -67,6 +67,23 @@ or:
 python main.py --hardware --servo-backend uart --uart-port /dev/ttyAMA0
 ```
 
+If the SDK backend says `No module named HiwonderSDK`, locate or copy the
+Hiwonder SDK from the ArmPi Pro software image/source package:
+
+```
+chmod +x scripts/find_hiwonder_sdk.sh scripts/list_serial_ports.sh
+./scripts/find_hiwonder_sdk.sh
+export HIWONDER_SDK_PATH=/path/that/contains/HiwonderSDK
+python main.py --servo-backend sdk --servo-self-test-only
+```
+
+If SDK is unavailable and you must use UART, first verify the real UART device:
+
+```
+./scripts/list_serial_ports.sh
+python main.py --servo-backend uart --uart-port /dev/ttyAMA0 --servo-self-test-only
+```
+
 Camera auto-detection is enabled by default. If OpenCV still cannot open the
 camera, pass the known index explicitly:
 
