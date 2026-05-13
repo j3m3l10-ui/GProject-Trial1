@@ -34,6 +34,7 @@ GRIPPER_CLOSE_PULSE = 700
 
 # ── Default UART settings ─────────────────────────────────────────────────────
 DEFAULT_UART_PORT = "auto"
+DEFAULT_DIRECTION_GPIO = 17
 FALLBACK_UART_PORTS = (
     "/dev/ttyUSB0",
     "/dev/ttyUSB1",
@@ -159,27 +160,32 @@ class ServoDriver:
 
     def __init__(self, mode: str = "sim", uart_port: str = DEFAULT_UART_PORT,
                  baud: int = DEFAULT_BAUD,
-                 backend: str = DEFAULT_SERVO_BACKEND):
+                 backend: str = DEFAULT_SERVO_BACKEND,
+                 direction_gpio: int = DEFAULT_DIRECTION_GPIO):
         """
         Args:
             mode: "real" for hardware UART, "sim" for simulation/logging
             uart_port: serial port path (RPi5: /dev/ttyAMA0)
             baud: baud rate
-            backend: "auto", "sdk", or "uart" for real hardware mode
+            backend: "auto", "sdk", "uart-gpio", or "uart" for real hardware mode
+            direction_gpio: BCM GPIO pin controlling half-duplex bus direction
         """
         self.mode = mode.lower()
         self.backend_requested = backend.lower()
         self.backend = "sim" if self.mode != "real" else None
         self.uart_port = uart_port
         self.baud = baud
+        self.direction_gpio = direction_gpio
+        self._gpio_handle = None
+        self._gpio_module = None
         self.serial_conn = None
         self.board = None
         self.state: Dict[int, int] = {}  # servo_id → current pulse
         self._move_log = []               # history of moves (for GUI playback)
 
         if self.mode == "real":
-            if self.backend_requested not in ("auto", "sdk", "uart"):
-                raise ValueError("backend must be one of: auto, sdk, uart")
+            if self.backend_requested not in ("auto", "sdk", "uart-gpio", "uart"):
+                raise ValueError("backend must be one of: auto, sdk, uart-gpio, uart")
 
             sdk_error = None
             if self.backend_requested in ("auto", "sdk"):
@@ -194,9 +200,19 @@ class ServoDriver:
                         "[SERVO] Hiwonder SDK backend unavailable (%s); "
                         "falling back to raw UART.", e)
 
+            if self.backend is None and self.backend_requested in ("auto", "uart-gpio"):
+                try:
+                    self._open_uart_backend(uart_port, baud, use_gpio=True)
+                except Exception as e:
+                    if self.backend_requested == "uart-gpio":
+                        raise
+                    logger.warning(
+                        "[SERVO] GPIO-controlled UART unavailable (%s); "
+                        "falling back to plain UART.", e)
+
             if self.backend is None and self.backend_requested in ("auto", "uart"):
                 try:
-                    self._open_uart_backend(uart_port, baud)
+                    self._open_uart_backend(uart_port, baud, use_gpio=False)
                 except Exception:
                     if sdk_error is not None:
                         logger.error(
@@ -229,13 +245,16 @@ class ServoDriver:
         raise ImportError(
             ("; ".join(errors) or "no SDK module candidates") + searched)
 
-    def _open_uart_backend(self, uart_port: str, baud: int):
+    def _open_uart_backend(self, uart_port: str, baud: int, use_gpio: bool = False):
         """Use direct serial bus-servo packets as a fallback backend."""
         errors = []
         last_error = None
         for candidate in _candidate_uart_ports(uart_port):
             try:
                 self._open_uart_candidate(candidate, baud)
+                if use_gpio:
+                    self._open_direction_gpio()
+                    self.backend = "uart-gpio"
                 self.uart_port = candidate
                 return
             except Exception as e:
@@ -262,6 +281,57 @@ class ServoDriver:
             logger.error(f"[SERVO] Cannot open raw UART {uart_port}: {e}")
             raise
 
+    def _open_direction_gpio(self):
+        """
+        Enable TX/RX direction control for Hiwonder half-duplex bus boards.
+        The common ArmPi/Hiwonder expansion-board direction pin is BCM GPIO17.
+        """
+        try:
+            import lgpio
+            handle = lgpio.gpiochip_open(0)
+            lgpio.gpio_claim_output(handle, self.direction_gpio, 0)
+            self._gpio_module = lgpio
+            self._gpio_handle = handle
+            logger.info(
+                "[SERVO] Enabled UART direction GPIO BCM%d via lgpio",
+                self.direction_gpio)
+            return
+        except Exception as lgpio_error:
+            try:
+                import RPi.GPIO as GPIO
+                GPIO.setwarnings(False)
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setup(self.direction_gpio, GPIO.OUT)
+                GPIO.output(self.direction_gpio, 0)
+                self._gpio_module = GPIO
+                self._gpio_handle = "RPi.GPIO"
+                logger.info(
+                    "[SERVO] Enabled UART direction GPIO BCM%d via RPi.GPIO",
+                    self.direction_gpio)
+                return
+            except Exception as gpio_error:
+                raise RuntimeError(
+                    f"Cannot enable direction GPIO BCM{self.direction_gpio}: "
+                    f"lgpio={lgpio_error}; RPi.GPIO={gpio_error}")
+
+    def _set_direction_tx(self):
+        if self._gpio_module is None:
+            return
+        if self._gpio_handle == "RPi.GPIO":
+            self._gpio_module.output(self.direction_gpio, 1)
+        else:
+            self._gpio_module.gpio_write(
+                self._gpio_handle, self.direction_gpio, 1)
+
+    def _set_direction_rx(self):
+        if self._gpio_module is None:
+            return
+        if self._gpio_handle == "RPi.GPIO":
+            self._gpio_module.output(self.direction_gpio, 0)
+        else:
+            self._gpio_module.gpio_write(
+                self._gpio_handle, self.direction_gpio, 0)
+
     def _fallback_to_uart_after_sdk_error(self, error):
         if self.backend_requested != "auto":
             raise RuntimeError(
@@ -275,7 +345,13 @@ class ServoDriver:
             "Falling back to raw UART.", error)
         self.board = None
         self.backend = None
-        self._open_uart_backend(self.uart_port, self.baud)
+        try:
+            self._open_uart_backend(self.uart_port, self.baud, use_gpio=True)
+        except Exception as gpio_error:
+            logger.warning(
+                "[SERVO] GPIO-controlled UART fallback failed (%s); "
+                "trying plain UART.", gpio_error)
+            self._open_uart_backend(self.uart_port, self.baud, use_gpio=False)
 
     # ── Move a single servo ────────────────────────────────────────────────────
     def move_servo(self, servo_id: int, pulse: int, duration_ms: int = 500):
@@ -293,9 +369,18 @@ class ServoDriver:
             except Exception as e:
                 self._fallback_to_uart_after_sdk_error(e)
                 self.move_servo(servo_id, pulse, duration_ms)
-        elif self.mode == "real" and self.backend == "uart" and self.serial_conn:
+        elif (self.mode == "real" and self.backend in ("uart", "uart-gpio") and
+              self.serial_conn):
             pkt = _build_move_cmd(servo_id, pulse, duration_ms)
+            self._set_direction_tx()
+            time.sleep(0.001)
             self.serial_conn.write(pkt)
+            try:
+                self.serial_conn.flush()
+            except Exception:
+                pass
+            time.sleep(0.003)
+            self._set_direction_rx()
             logger.debug(f"[SERVO UART] ID{servo_id} → {pulse}  ({duration_ms}ms)")
         else:
             logger.debug(f"[SIM] ID{servo_id} → {pulse}  ({duration_ms}ms)")
@@ -346,3 +431,8 @@ class ServoDriver:
         if self.serial_conn:
             self.serial_conn.close()
             logger.info("[SERVO] UART closed")
+        if self._gpio_module is not None and self._gpio_handle not in (None, "RPi.GPIO"):
+            try:
+                self._gpio_module.gpiochip_close(self._gpio_handle)
+            except Exception:
+                pass

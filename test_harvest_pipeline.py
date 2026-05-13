@@ -16,7 +16,7 @@ except ImportError:
 import main
 from arm_controller import CUT_GAP_M, FiveDOFArm, compute_cut_point, search_home_angles
 from servo_driver import (
-    DEFAULT_BAUD, DEFAULT_SERVO_BACKEND, DEFAULT_UART_PORT,
+    DEFAULT_BAUD, DEFAULT_DIRECTION_GPIO, DEFAULT_SERVO_BACKEND, DEFAULT_UART_PORT,
     GRIPPER_OPEN_PULSE, ServoDriver,
 )
 from vision import TomatoDetector
@@ -305,6 +305,52 @@ class HarvestPipelineTest(unittest.TestCase):
         self.assertTrue(all(packet.startswith(b"\x55\x55") for packet in writes))
         self.assertEqual([packet[2] for packet in writes], [6, 5, 4, 3, 1])
 
+    def test_uart_gpio_backend_toggles_direction_pin(self):
+        writes = []
+        gpio_writes = []
+
+        class FakeSerial:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def write(self, packet):
+                writes.append(packet)
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        fake_serial = types.SimpleNamespace(
+            Serial=FakeSerial,
+            PARITY_NONE="N",
+            STOPBITS_ONE=1,
+        )
+        fake_lgpio = types.SimpleNamespace(
+            gpiochip_open=lambda _chip: 99,
+            gpio_claim_output=lambda handle, pin, value: gpio_writes.append(
+                ("claim", handle, pin, value)),
+            gpio_write=lambda handle, pin, value: gpio_writes.append(
+                ("write", handle, pin, value)),
+            gpiochip_close=lambda handle: gpio_writes.append(("close", handle)),
+        )
+
+        with mock.patch.dict(sys.modules, {
+            "serial": fake_serial,
+            "lgpio": fake_lgpio,
+        }):
+            driver = ServoDriver(mode="real", backend="uart-gpio",
+                                 uart_port="/dev/fake", direction_gpio=17)
+            driver.move_servo(6, 500, duration_ms=123)
+            driver.close()
+
+        self.assertEqual(driver.backend, "uart-gpio")
+        self.assertEqual(len(writes), 1)
+        self.assertIn(("claim", 99, 17, 0), gpio_writes)
+        self.assertIn(("write", 99, 17, 1), gpio_writes)
+        self.assertIn(("write", 99, 17, 0), gpio_writes)
+
     def test_auto_backend_falls_back_to_uart_when_sdk_is_unavailable(self):
         writes = []
 
@@ -534,6 +580,7 @@ class HarvestPipelineTest(unittest.TestCase):
             servo_backend=DEFAULT_SERVO_BACKEND,
             uart_port=DEFAULT_UART_PORT,
             baud=DEFAULT_BAUD,
+            direction_gpio=DEFAULT_DIRECTION_GPIO,
             servo_self_test=False)
 
     def test_main_passes_servo_backend_cli_options(self):
@@ -556,6 +603,7 @@ class HarvestPipelineTest(unittest.TestCase):
             servo_backend="sdk",
             uart_port="/dev/test",
             baud=57600,
+            direction_gpio=DEFAULT_DIRECTION_GPIO,
             servo_self_test=False)
 
     def test_ros_camera_source_reads_image_topic_frame(self):

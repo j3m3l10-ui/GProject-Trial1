@@ -41,7 +41,7 @@ from arm_controller import (
     compute_cut_point, SERVO_IDS, SEARCH_HOME_PULSES,
 )
 from servo_driver import (
-    DEFAULT_BAUD, DEFAULT_SERVO_BACKEND, DEFAULT_UART_PORT,
+    DEFAULT_BAUD, DEFAULT_DIRECTION_GPIO, DEFAULT_SERVO_BACKEND, DEFAULT_UART_PORT,
     GRIPPER_CLOSE_PULSE, GRIPPER_OPEN_PULSE, ServoDriver,
 )
 
@@ -686,6 +686,7 @@ def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
                    servo_backend=DEFAULT_SERVO_BACKEND,
                    uart_port=DEFAULT_UART_PORT,
                    baud=DEFAULT_BAUD,
+                   direction_gpio=DEFAULT_DIRECTION_GPIO,
                    servo_self_test=False):
     mode = "sim" if sim_mode else "real"
     logger.info(f"Starting harvesting system in {mode.upper()} mode")
@@ -698,7 +699,8 @@ def run_harvesting(sim_mode=False, confirm_seconds=CONFIRM_SECONDS,
     detector = TomatoDetector()
     arm = FiveDOFArm()
     driver = ServoDriver(mode=mode, backend=servo_backend,
-                         uart_port=uart_port, baud=baud)
+                         uart_port=uart_port, baud=baud,
+                         direction_gpio=direction_gpio)
     if not sim_mode and servo_self_test:
         _run_servo_self_test(driver)
 
@@ -914,13 +916,16 @@ def main():
     parser.add_argument("--confirm-frames", type=int, default=CONFIRM_FRAMES,
                         help=f"Detection frames required before moving (default: {CONFIRM_FRAMES})")
     parser.add_argument("--servo-backend",
-                        choices=("auto", "sdk", "uart"),
+                        choices=("auto", "sdk", "uart-gpio", "uart"),
                         default=DEFAULT_SERVO_BACKEND,
-                        help="Real servo backend: auto tries Hiwonder SDK before raw UART")
+                        help="Real servo backend: auto tries SDK, GPIO-UART, then raw UART")
     parser.add_argument("--uart-port", default=DEFAULT_UART_PORT,
                         help=f"Raw UART serial port (default: {DEFAULT_UART_PORT})")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD,
                         help=f"Raw UART baud rate (default: {DEFAULT_BAUD})")
+    parser.add_argument("--direction-gpio", type=int,
+                        default=DEFAULT_DIRECTION_GPIO,
+                        help=f"BCM GPIO for half-duplex UART direction (default: {DEFAULT_DIRECTION_GPIO})")
     parser.add_argument("--servo-self-test", action="store_true",
                         help="Run a small safe servo movement before harvesting")
     parser.add_argument("--servo-self-test-only", action="store_true",
@@ -937,7 +942,8 @@ def main():
             mode="sim" if args.sim else "real",
             backend=args.servo_backend,
             uart_port=args.uart_port,
-            baud=args.baud)
+            baud=args.baud,
+            direction_gpio=args.direction_gpio)
         try:
             _run_servo_self_test(driver)
         finally:
@@ -953,6 +959,7 @@ def main():
                        servo_backend=args.servo_backend,
                        uart_port=args.uart_port,
                        baud=args.baud,
+                       direction_gpio=args.direction_gpio,
                        servo_self_test=args.servo_self_test)
 
 

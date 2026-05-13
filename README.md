@@ -92,6 +92,7 @@ environment. Use the backend auto-fallback or bypass SDK:
 chmod +x scripts/check_lgpio_environment.sh
 ./scripts/check_lgpio_environment.sh
 python main.py --servo-backend auto --uart-port auto --servo-self-test-only
+python main.py --servo-backend uart-gpio --uart-port auto --direction-gpio 17 --servo-self-test-only
 python main.py --servo-backend uart --uart-port auto --servo-self-test-only
 ```
 
