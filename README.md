@@ -86,12 +86,17 @@ USB/UVC camera through ROS first. These cameras are driver-free USB cameras, so
 the standard ROS1 `usb_cam` node is the expected bridge:
 
 ```
+ls /opt/ros/
+chmod +x scripts/install_ros_usb_camera_deps.sh scripts/start_hiwonder_camera_ros.sh scripts/check_ros_camera_topic.sh
+./scripts/install_ros_usb_camera_deps.sh
+export ROS_DISTRO=$(ls /opt/ros | sort | head -n 1)
 source /opt/ros/$ROS_DISTRO/setup.bash
-sudo apt update
-sudo apt install ros-$ROS_DISTRO-usb-cam ros-$ROS_DISTRO-cv-bridge
-chmod +x scripts/start_hiwonder_camera_ros.sh scripts/check_ros_camera_topic.sh
 ./scripts/start_hiwonder_camera_ros.sh /dev/video0 640 480 30 mjpeg
 ```
+
+If `/opt/ros` does not exist, ROS is not installed. Install a ROS1 distro for
+your OS first. This project uses ROS1 APIs (`rospy`, `rostopic`, `roslaunch`),
+not ROS2.
 
 In a second terminal:
 
