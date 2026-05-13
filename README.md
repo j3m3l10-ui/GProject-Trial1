@@ -98,6 +98,22 @@ If `/opt/ros` does not exist, ROS is not installed. Install a ROS1 distro for
 your OS first. This project uses ROS1 APIs (`rospy`, `rostopic`, `roslaunch`),
 not ROS2.
 
+On Debian 13, do not install ROS Noetic manually unless you are prepared to
+build unsupported packages from source. Use the direct OpenCV/V4L2 path for the
+Hiwonder driver-free USB camera instead:
+
+```
+sudo apt update
+sudo apt install -y v4l-utils
+chmod +x scripts/list_hiwonder_cameras.sh scripts/run_harvester_debian_opencv.sh scripts/test_opencv_camera.py
+./scripts/list_hiwonder_cameras.sh
+python3 scripts/test_opencv_camera.py --camera 0
+./scripts/run_harvester_debian_opencv.sh 0 auto
+```
+
+If `/dev/video0` does not stream frames, replace `0` with the capture-capable
+index shown by `scripts/list_hiwonder_cameras.sh`.
+
 In a second terminal:
 
 ```
