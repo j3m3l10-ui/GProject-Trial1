@@ -81,6 +81,26 @@ ROS, run from a sourced ROS shell and subscribe to the image topic instead:
 python main.py --hardware --camera-source ros --ros-image-topic /usb_cam/image_raw
 ```
 
+If `rostopic list | grep image` shows no image topics, start the Hiwonder
+USB/UVC camera through ROS first. These cameras are driver-free USB cameras, so
+the standard ROS1 `usb_cam` node is the expected bridge:
+
+```
+source /opt/ros/$ROS_DISTRO/setup.bash
+sudo apt update
+sudo apt install ros-$ROS_DISTRO-usb-cam ros-$ROS_DISTRO-cv-bridge
+chmod +x scripts/start_hiwonder_camera_ros.sh scripts/check_ros_camera_topic.sh
+./scripts/start_hiwonder_camera_ros.sh /dev/video0 640 480 30 mjpeg
+```
+
+In a second terminal:
+
+```
+source /opt/ros/$ROS_DISTRO/setup.bash
+./scripts/check_ros_camera_topic.sh /hiwonder_usb_camera/image_raw
+python main.py --hardware --camera-source ros --ros-image-topic /hiwonder_usb_camera/image_raw --servo-backend auto
+```
+
 ### 4. Run Camera-Only Detection
 
 ```

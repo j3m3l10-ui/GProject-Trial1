@@ -1,0 +1,25 @@
+<launch>
+  <!-- Hiwonder USB/UVC wide-angle cameras are driver-free; usb_cam publishes
+       frames as sensor_msgs/Image for the harvester's --camera-source ros path. -->
+  <arg name="video_device" default="/dev/video0" />
+  <arg name="image_width" default="640" />
+  <arg name="image_height" default="480" />
+  <arg name="framerate" default="30" />
+  <arg name="pixel_format" default="mjpeg" />
+  <arg name="camera_frame_id" default="hiwonder_camera" />
+  <arg name="camera_name" default="hiwonder_usb_camera" />
+
+  <node name="hiwonder_usb_camera"
+        pkg="usb_cam"
+        type="usb_cam_node"
+        output="screen">
+    <param name="video_device" value="$(arg video_device)" />
+    <param name="image_width" value="$(arg image_width)" />
+    <param name="image_height" value="$(arg image_height)" />
+    <param name="framerate" value="$(arg framerate)" />
+    <param name="pixel_format" value="$(arg pixel_format)" />
+    <param name="camera_frame_id" value="$(arg camera_frame_id)" />
+    <param name="camera_name" value="$(arg camera_name)" />
+    <param name="io_method" value="mmap" />
+  </node>
+</launch>
