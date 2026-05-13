@@ -52,8 +52,8 @@ servo commands. The default servo backend tries Hiwonder's
 When a ripe tomato appears, the robot now records a 3-second validation
 snapshot, ranks up to the 3 closest tomatoes, and harvests them in that order.
 During each approach the camera keeps streaming live detections so the arm
-moves in small IK-guided steps until the tomato nearly fills the frame, then
-cuts 1 cm vertically above the live tomato centre.
+moves in small relative image-centering IK steps until the tomato nearly fills
+the frame, then cuts 1 cm vertically above the live tomato centre.
 
 If the arm still does not move, force the hardware backend explicitly:
 

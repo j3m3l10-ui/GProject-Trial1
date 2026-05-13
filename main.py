@@ -63,10 +63,13 @@ VALIDATION_TRACK_TOLERANCE_CM = 5.0
 VALIDATION_MIN_OBSERVATIONS = 2
 GUIDED_APPROACH_MAX_STEPS = 45
 GUIDED_APPROACH_STEP_M = 0.012
+GUIDED_LATERAL_STEP_M = 0.008
+GUIDED_VERTICAL_STEP_M = 0.008
 GUIDED_APPROACH_FILL_RATIO = 0.42
 GUIDED_APPROACH_STOP_DEPTH_CM = 10.0
 GUIDED_TARGET_LOST_LIMIT = 8
 GUIDED_CUT_OFFSET_M = 0.01
+GUIDED_CENTER_TOLERANCE_RATIO = 0.08
 CAMERA_INDEX       = -1      # -1 = auto-detect camera
 DEFAULT_CAMERA_SOURCE = "opencv"
 DEFAULT_ROS_IMAGE_TOPIC = "/camera/image_raw"
@@ -490,6 +493,52 @@ def _solve_and_command_point(arm, driver, target_m,
     return True, "moved"
 
 
+def _visual_servo_target_point(arm, detection, frame_shape):
+    """
+    Compute the next small base-frame step from image error.
+
+    The wrist camera moves with the arm, so live guidance must use relative
+    image-centering corrections instead of the fixed search-home camera
+    transform. Positive image X maps to arm -Y and positive image Y maps to
+    arm -Z for the current mounting convention.
+    """
+    frame_h, frame_w = frame_shape[:2]
+    frame_w = max(1, frame_w)
+    frame_h = max(1, frame_h)
+    cx, cy = detection["center_px"]
+    norm_x = (cx - frame_w / 2.0) / (frame_w / 2.0)
+    norm_y = (cy - frame_h / 2.0) / (frame_h / 2.0)
+    fill_ratio = _detection_fill_ratio(detection, frame_shape)
+
+    current_m = arm.end_effector_pos()
+    approach_scale = max(0.0, 1.0 - fill_ratio / GUIDED_APPROACH_FILL_RATIO)
+    if detection["xyz_cm"]["z"] <= GUIDED_APPROACH_STOP_DEPTH_CM:
+        approach_scale = 0.0
+
+    delta = np.array([
+        GUIDED_APPROACH_STEP_M * min(1.0, approach_scale),
+        -GUIDED_LATERAL_STEP_M * float(np.clip(norm_x, -1.0, 1.0)),
+        -GUIDED_VERTICAL_STEP_M * float(np.clip(norm_y, -1.0, 1.0)),
+    ], dtype=float)
+    return current_m + delta
+
+
+def _is_detection_close_enough(detection, frame_shape):
+    frame_h, frame_w = frame_shape[:2]
+    cx, cy = detection["center_px"]
+    norm_x = abs((cx - frame_w / 2.0) / max(1.0, frame_w / 2.0))
+    norm_y = abs((cy - frame_h / 2.0) / max(1.0, frame_h / 2.0))
+    centered = (norm_x <= GUIDED_CENTER_TOLERANCE_RATIO and
+                norm_y <= GUIDED_CENTER_TOLERANCE_RATIO)
+    return (
+        centered and (
+            _detection_fill_ratio(detection, frame_shape) >=
+            GUIDED_APPROACH_FILL_RATIO or
+            detection["xyz_cm"]["z"] <= GUIDED_APPROACH_STOP_DEPTH_CM
+        )
+    )
+
+
 def _guided_harvest_target(arm, driver, detector, cap, reference_target):
     """Use live detections to slowly approach and cut one ranked target."""
     logger.info("Guided harvest for snapshot rank %s started.",
@@ -499,7 +548,7 @@ def _guided_harvest_target(arm, driver, detector, cap, reference_target):
 
     last_detection = None
     lost_count = 0
-    final_center_m = None
+    saw_target = False
 
     for step in range(1, GUIDED_APPROACH_MAX_STEPS + 1):
         ret, frame = cap.read()
@@ -530,30 +579,23 @@ def _guided_harvest_target(arm, driver, detector, cap, reference_target):
 
         lost_count = 0
         last_detection = target
+        saw_target = True
         fill_ratio = _detection_fill_ratio(target, frame.shape)
-        final_center_m = camera_to_arm_frame(target["xyz_cm"])
         logger.info(
             "Guided rank %s step %s: fill=%.2f z=%.1fcm center=%s",
             reference_target["rank"], step, fill_ratio,
             target["xyz_cm"]["z"], target["center_px"])
 
-        if (fill_ratio >= GUIDED_APPROACH_FILL_RATIO or
-                target["xyz_cm"]["z"] <= GUIDED_APPROACH_STOP_DEPTH_CM):
-            logger.info("Rank %s close enough for cut (fill=%.2f, z=%.1fcm).",
+        if _is_detection_close_enough(target, frame.shape):
+            logger.info("Rank %s centered and close enough for cut "
+                        "(fill=%.2f, z=%.1fcm).",
                         reference_target["rank"], fill_ratio,
                         target["xyz_cm"]["z"])
             cv2.imshow("Tomato Harvester", annotated)
             cv2.waitKey(1)
             break
 
-        current_m = arm.end_effector_pos()
-        delta = final_center_m - current_m
-        distance = np.linalg.norm(delta)
-        if distance > GUIDED_APPROACH_STEP_M:
-            next_point_m = current_m + (delta / distance) * GUIDED_APPROACH_STEP_M
-        else:
-            next_point_m = final_center_m
-
+        next_point_m = _visual_servo_target_point(arm, target, frame.shape)
         ok, reason = _solve_and_command_point(arm, driver, next_point_m)
         if not ok:
             return False, reason
@@ -567,13 +609,13 @@ def _guided_harvest_target(arm, driver, detector, cap, reference_target):
         logger.warning("Guided approach reached max steps for rank %s.",
                        reference_target["rank"])
 
-    if final_center_m is None:
+    if not saw_target:
         return False, "no final target center"
 
-    cut_point_m = final_center_m + (
+    cut_point_m = arm.end_effector_pos() + (
         STEM_DIRECTION_ARM_FRAME / np.linalg.norm(STEM_DIRECTION_ARM_FRAME)
     ) * GUIDED_CUT_OFFSET_M
-    logger.info("Rank %s cut point 1cm above live center: %s",
+    logger.info("Rank %s cut point 1cm vertically above current end-effector: %s",
                 reference_target["rank"], np.round(cut_point_m, 4))
 
     ok, reason = _solve_and_command_point(

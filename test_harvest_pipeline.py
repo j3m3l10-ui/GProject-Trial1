@@ -31,6 +31,7 @@ class FakeArm:
     def __init__(self, reachable=True, ik_result=(True, 0.0, 1)):
         self.base_pos = np.zeros(3, dtype=float)
         self.joint_angles = np.zeros(5, dtype=float)
+        self.ee_pos = np.array([0.25, 0.0, 0.18], dtype=float)
         self.reachable = reachable
         self.ik_result = ik_result
         self.reach_checks = []
@@ -46,6 +47,9 @@ class FakeArm:
     def inverse_kinematics(self, target, max_iters=300, tol=5e-4):
         self.ik_target = np.array(target, dtype=float)
         return self.ik_result
+
+    def end_effector_pos(self):
+        return self.ee_pos.copy()
 
     def set_joint_angles(self, angles):
         self.joint_angles = np.array(angles, dtype=float)
@@ -130,8 +134,8 @@ class HarvestPipelineTest(unittest.TestCase):
         class FakeDetector:
             def detect(self, _frame):
                 det = detection(0.0, 0.0, 10.0, confidence=0.95)
-                det["bbox_px"] = [10, 10, 210, 210]
-                det["center_px"] = [110, 110]
+                det["bbox_px"] = [20, 20, 220, 220]
+                det["center_px"] = [120, 120]
                 return [det]
 
             def annotate(self, frame, _detections):
@@ -146,8 +150,8 @@ class HarvestPipelineTest(unittest.TestCase):
         reference = detection(0.0, 0.0, 10.0, confidence=0.95)
         reference.update({
             "rank": 1,
-            "bbox_px": [10, 10, 210, 210],
-            "center_px": [110, 110],
+            "bbox_px": [20, 20, 220, 220],
+            "center_px": [120, 120],
         })
 
         with mock.patch.object(main.cv2, "imshow"), \
@@ -155,11 +159,23 @@ class HarvestPipelineTest(unittest.TestCase):
             harvest_ok, reason = main._guided_harvest_target(
                 arm, driver, FakeDetector(), FakeCapture(), reference)
 
-        expected_center = main.camera_to_arm_frame({"x": 0.0, "y": 0.0, "z": 10.0})
-        expected_cut = expected_center + np.array([0.0, 0.0, main.GUIDED_CUT_OFFSET_M])
+        expected_cut = arm.ee_pos + np.array([0.0, 0.0, main.GUIDED_CUT_OFFSET_M])
         self.assertTrue(harvest_ok, reason)
         np.testing.assert_allclose(arm.ik_target, expected_cut)
         self.assertIn(("close", 500), driver.calls)
+
+    def test_visual_servo_moves_relative_to_image_error(self):
+        arm = FakeArm()
+        det = detection(0.0, 0.0, 30.0, confidence=0.9)
+        det["bbox_px"] = [250, 150, 330, 230]
+        det["center_px"] = [480, 360]  # right and below image centre
+
+        target = main._visual_servo_target_point(arm, det, (480, 640, 3))
+        delta = target - arm.end_effector_pos()
+
+        self.assertGreater(delta[0], 0.0)   # approach forward while tomato is small
+        self.assertLess(delta[1], 0.0)      # image right maps to arm -Y
+        self.assertLess(delta[2], 0.0)      # image down maps to arm -Z
 
     def test_harvest_reachability_uses_cut_point(self):
         arm = FakeArm(reachable=False)
