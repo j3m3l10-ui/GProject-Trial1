@@ -5,3 +5,5 @@ matplotlib
 pyyaml
 Pillow
 pyserial
+dynamixel-sdk
+pyrealsense2
